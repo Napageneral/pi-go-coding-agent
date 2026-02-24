@@ -2,6 +2,7 @@ const state = {
 	cancelNextSwitch: false,
 	cancelNextFork: false,
 	cancelNextTree: false,
+	injectTreeSummaryNext: false,
 	beforeSwitch: [],
 	switchEvents: [],
 	beforeFork: [],
@@ -65,6 +66,15 @@ export default function extension(pi) {
 			state.cancelNextTree = false;
 			return { cancel: true };
 		}
+		if (state.injectTreeSummaryNext) {
+			state.injectTreeSummaryNext = false;
+			return {
+				summary: {
+					summary: "parity-tree-summary",
+					details: { source: "session_parity_extension" },
+				},
+			};
+		}
 		return undefined;
 	});
 
@@ -100,11 +110,28 @@ export default function extension(pi) {
 		},
 	});
 
+	pi.registerCommand("armtreesummary", {
+		description: "Inject summary on next tree navigation",
+		handler: async () => {
+			state.injectTreeSummaryNext = true;
+			return "tree-summary-armed";
+		},
+	});
+
 	pi.registerCommand("newsession", {
 		description: "Create a new session",
 		handler: async (_args, ctx) => {
-			await ctx.newSession();
-			return "new-session-ok";
+			const result = await ctx.newSession();
+			return result?.cancelled ? "new-session-cancelled" : "new-session-ok";
+		},
+	});
+
+	pi.registerCommand("newsessionparent", {
+		description: "Create a new session with explicit parent session path",
+		handler: async (args, ctx) => {
+			const parentSession = String(args || "").trim();
+			const result = await ctx.newSession({ parentSession });
+			return result?.cancelled ? "new-session-parent-cancelled" : "new-session-parent-ok";
 		},
 	});
 
@@ -112,8 +139,8 @@ export default function extension(pi) {
 		description: "Switch to session path",
 		handler: async (args, ctx) => {
 			const sessionPath = String(args || "").trim();
-			await ctx.switchSession(sessionPath);
-			return "switch-session-ok";
+			const result = await ctx.switchSession(sessionPath);
+			return result?.cancelled ? "switch-session-cancelled" : "switch-session-ok";
 		},
 	});
 
@@ -121,8 +148,8 @@ export default function extension(pi) {
 		description: "Fork at entry id",
 		handler: async (args, ctx) => {
 			const entryId = String(args || "").trim();
-			await ctx.fork(entryId);
-			return "fork-ok";
+			const result = await ctx.fork(entryId);
+			return result?.cancelled ? "fork-cancelled" : "fork-ok";
 		},
 	});
 
@@ -130,13 +157,13 @@ export default function extension(pi) {
 		description: "Navigate to target with options",
 		handler: async (args, ctx) => {
 			const targetId = String(args || "").trim();
-			await ctx.navigateTree(targetId, {
+			const result = await ctx.navigateTree(targetId, {
 				summarize: true,
 				customInstructions: "parity-tree-custom",
 				replaceInstructions: true,
 				label: "parity-tree-label",
 			});
-			return "navigate-opts-ok";
+			return result?.cancelled ? "navigate-opts-cancelled" : "navigate-opts-ok";
 		},
 	});
 

@@ -45,6 +45,7 @@ type Entry struct {
 	TokensBefore   int                  `json:"tokensBefore,omitempty"`
 	FromID         string               `json:"fromId,omitempty"`
 	FromHook       bool                 `json:"fromHook,omitempty"`
+	Details        map[string]any       `json:"details,omitempty"`
 	CustomType     string               `json:"customType,omitempty"`
 	CustomData     map[string]any       `json:"data,omitempty"`
 	Display        bool                 `json:"display,omitempty"`
@@ -250,6 +251,15 @@ func (m *Manager) AppendThinkingLevel(level string) (Entry, error) {
 }
 
 func (m *Manager) AppendCompaction(summary, firstKeptEntryID string, tokensBefore int) (Entry, error) {
+	return m.AppendCompactionWithDetails(summary, firstKeptEntryID, tokensBefore, nil)
+}
+
+func (m *Manager) AppendCompactionWithDetails(
+	summary,
+	firstKeptEntryID string,
+	tokensBefore int,
+	details map[string]any,
+) (Entry, error) {
 	e := Entry{
 		Type:           "compaction",
 		ID:             m.nextID(),
@@ -258,6 +268,7 @@ func (m *Manager) AppendCompaction(summary, firstKeptEntryID string, tokensBefor
 		Summary:        summary,
 		FirstKeptEntry: firstKeptEntryID,
 		TokensBefore:   tokensBefore,
+		Details:        cloneMap(details),
 	}
 	if err := m.appendEntry(e); err != nil {
 		return Entry{}, err
@@ -266,6 +277,10 @@ func (m *Manager) AppendCompaction(summary, firstKeptEntryID string, tokensBefor
 }
 
 func (m *Manager) AppendBranchSummary(fromID, summary string) (Entry, error) {
+	return m.AppendBranchSummaryWithDetails(fromID, summary, nil)
+}
+
+func (m *Manager) AppendBranchSummaryWithDetails(fromID, summary string, details map[string]any) (Entry, error) {
 	e := Entry{
 		Type:      "branch_summary",
 		ID:        m.nextID(),
@@ -273,6 +288,7 @@ func (m *Manager) AppendBranchSummary(fromID, summary string) (Entry, error) {
 		Timestamp: nowTS(),
 		FromID:    fromID,
 		Summary:   summary,
+		Details:   cloneMap(details),
 	}
 	if err := m.appendEntry(e); err != nil {
 		return Entry{}, err
@@ -399,8 +415,33 @@ func (m *Manager) BuildContext(systemPrompt string, leafID string, tools []types
 	messages := make([]types.Message, 0, len(branch))
 	thinking := "medium"
 	var provider, modelID string
+	var compaction *Entry
 
-	for _, e := range branch {
+	for i := range branch {
+		e := branch[i]
+		switch e.Type {
+		case "thinking_level_change":
+			if e.ThinkingLevel != "" {
+				thinking = e.ThinkingLevel
+			}
+		case "model_change":
+			provider = e.Provider
+			modelID = e.ModelID
+		case "message":
+			if e.Message != nil && e.Message.Role == types.RoleAssistant {
+				if e.Message.Provider != "" {
+					provider = e.Message.Provider
+				}
+				if e.Message.Model != "" {
+					modelID = e.Message.Model
+				}
+			}
+		case "compaction":
+			compaction = &branch[i]
+		}
+	}
+
+	appendEntryMessage := func(e Entry) {
 		switch e.Type {
 		case "message":
 			if e.Message != nil {
@@ -414,21 +455,40 @@ func (m *Manager) BuildContext(systemPrompt string, leafID string, tools []types
 					Content:   e.Content,
 				})
 			}
-		case "thinking_level_change":
-			if e.ThinkingLevel != "" {
-				thinking = e.ThinkingLevel
-			}
-		case "model_change":
-			provider = e.Provider
-			modelID = e.ModelID
-		case "compaction":
-			if e.Summary != "" {
-				messages = append(messages, types.TextMessage(types.RoleUser, "<summary>\n"+e.Summary+"\n</summary>"))
-			}
 		case "branch_summary":
 			if e.Summary != "" {
 				messages = append(messages, types.TextMessage(types.RoleUser, "<branch_summary>\n"+e.Summary+"\n</branch_summary>"))
 			}
+		}
+	}
+
+	if compaction != nil {
+		if compaction.Summary != "" {
+			messages = append(messages, types.TextMessage(types.RoleUser, "<summary>\n"+compaction.Summary+"\n</summary>"))
+		}
+		compactionIdx := -1
+		for i := range branch {
+			if branch[i].Type == "compaction" && branch[i].ID == compaction.ID {
+				compactionIdx = i
+				break
+			}
+		}
+		foundFirstKept := false
+		for i := 0; i < compactionIdx; i++ {
+			e := branch[i]
+			if e.ID == compaction.FirstKeptEntry {
+				foundFirstKept = true
+			}
+			if foundFirstKept {
+				appendEntryMessage(e)
+			}
+		}
+		for i := compactionIdx + 1; i < len(branch); i++ {
+			appendEntryMessage(branch[i])
+		}
+	} else {
+		for _, e := range branch {
+			appendEntryMessage(e)
 		}
 	}
 
@@ -534,6 +594,17 @@ func shortID() string {
 		return fmt.Sprintf("%08x", time.Now().UnixNano())[:8]
 	}
 	return hex.EncodeToString(b)
+}
+
+func cloneMap(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 func nowTS() string {

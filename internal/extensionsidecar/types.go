@@ -5,15 +5,30 @@ import "github.com/badlogic/pi-mono/go-coding-agent/internal/types"
 const ProtocolVersion = "2026-02-24"
 
 type InitializeRequest struct {
-	ProtocolVersion string         `json:"protocolVersion"`
-	CWD             string         `json:"cwd"`
-	SessionID       string         `json:"sessionId"`
-	SessionFile     string         `json:"sessionFile"`
-	SessionName     string         `json:"sessionName,omitempty"`
-	HostTools       []types.Tool   `json:"hostTools,omitempty"`
-	ActiveTools     []string       `json:"activeTools,omitempty"`
-	ExtensionPaths  []string       `json:"extensionPaths,omitempty"`
-	FlagValues      map[string]any `json:"flagValues,omitempty"`
+	ProtocolVersion    string            `json:"protocolVersion"`
+	CWD                string            `json:"cwd"`
+	SessionID          string            `json:"sessionId"`
+	SessionFile        string            `json:"sessionFile"`
+	SessionDir         string            `json:"sessionDir,omitempty"`
+	SessionName        string            `json:"sessionName,omitempty"`
+	LeafID             string            `json:"leafId,omitempty"`
+	SessionHeader      map[string]any    `json:"sessionHeader,omitempty"`
+	SessionEntries     []map[string]any  `json:"sessionEntries,omitempty"`
+	CurrentModel       *types.Model      `json:"currentModel,omitempty"`
+	AllModels          []types.Model     `json:"allModels,omitempty"`
+	AvailableModels    []types.Model     `json:"availableModels,omitempty"`
+	ProviderAPIKeys    map[string]string `json:"providerApiKeys,omitempty"`
+	ProviderAuthTypes  map[string]string `json:"providerAuthTypes,omitempty"`
+	ContextUsage       map[string]any    `json:"contextUsage,omitempty"`
+	SystemPrompt       string            `json:"systemPrompt,omitempty"`
+	ThinkingLevel      string            `json:"thinkingLevel,omitempty"`
+	IsIdle             bool              `json:"isIdle"`
+	HasPendingMessages bool              `json:"hasPendingMessages"`
+	HostTools          []types.Tool      `json:"hostTools,omitempty"`
+	ActiveTools        []string          `json:"activeTools,omitempty"`
+	ExtensionPaths     []string          `json:"extensionPaths,omitempty"`
+	FlagValues         map[string]any    `json:"flagValues,omitempty"`
+	HasUI              bool              `json:"hasUI,omitempty"`
 }
 
 type ExtensionFlagDefinition struct {
@@ -26,6 +41,7 @@ type ExtensionFlagDefinition struct {
 type ExtensionCommandDefinition struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
+	Path        string `json:"path,omitempty"`
 }
 
 type ProviderRegistration struct {
@@ -101,16 +117,29 @@ type SessionBeforeTreeEventResult struct {
 	Label               string                    `json:"label,omitempty"`
 }
 
+type CompactResult struct {
+	Summary          string         `json:"summary,omitempty"`
+	FirstKeptEntryID string         `json:"firstKeptEntryId,omitempty"`
+	TokensBefore     int            `json:"tokensBefore,omitempty"`
+	Details          map[string]any `json:"details,omitempty"`
+}
+
+type SessionBeforeCompactEventResult struct {
+	Cancel     bool           `json:"cancel,omitempty"`
+	Compaction *CompactResult `json:"compaction,omitempty"`
+}
+
 type EmitResponse struct {
-	Input               *InputEventResult               `json:"input,omitempty"`
-	BeforeAgentStart    *BeforeAgentStartEventResult    `json:"beforeAgentStart,omitempty"`
-	Context             *ContextEventResult             `json:"context,omitempty"`
-	ToolCall            *ToolCallEventResult            `json:"toolCall,omitempty"`
-	ToolResult          *ToolResultEventResult          `json:"toolResult,omitempty"`
-	SessionBeforeSwitch *SessionBeforeSwitchEventResult `json:"sessionBeforeSwitch,omitempty"`
-	SessionBeforeFork   *SessionBeforeForkEventResult   `json:"sessionBeforeFork,omitempty"`
-	SessionBeforeTree   *SessionBeforeTreeEventResult   `json:"sessionBeforeTree,omitempty"`
-	Actions             []HostAction                    `json:"actions,omitempty"`
+	Input                *InputEventResult                `json:"input,omitempty"`
+	BeforeAgentStart     *BeforeAgentStartEventResult     `json:"beforeAgentStart,omitempty"`
+	Context              *ContextEventResult              `json:"context,omitempty"`
+	ToolCall             *ToolCallEventResult             `json:"toolCall,omitempty"`
+	ToolResult           *ToolResultEventResult           `json:"toolResult,omitempty"`
+	SessionBeforeSwitch  *SessionBeforeSwitchEventResult  `json:"sessionBeforeSwitch,omitempty"`
+	SessionBeforeFork    *SessionBeforeForkEventResult    `json:"sessionBeforeFork,omitempty"`
+	SessionBeforeCompact *SessionBeforeCompactEventResult `json:"sessionBeforeCompact,omitempty"`
+	SessionBeforeTree    *SessionBeforeTreeEventResult    `json:"sessionBeforeTree,omitempty"`
+	Actions              []HostAction                     `json:"actions,omitempty"`
 }
 
 type ExecuteToolRequest struct {
@@ -120,14 +149,50 @@ type ExecuteToolRequest struct {
 }
 
 type ExecuteCommandRequest struct {
-	Name string `json:"name"`
-	Args string `json:"args,omitempty"`
+	Name               string            `json:"name"`
+	Args               string            `json:"args,omitempty"`
+	CurrentModel       *types.Model      `json:"currentModel,omitempty"`
+	AllModels          []types.Model     `json:"allModels,omitempty"`
+	AvailableModels    []types.Model     `json:"availableModels,omitempty"`
+	ProviderAPIKeys    map[string]string `json:"providerApiKeys,omitempty"`
+	ProviderAuthTypes  map[string]string `json:"providerAuthTypes,omitempty"`
+	ContextUsage       map[string]any    `json:"contextUsage,omitempty"`
+	SystemPrompt       string            `json:"systemPrompt,omitempty"`
+	ThinkingLevel      string            `json:"thinkingLevel,omitempty"`
+	IsIdle             bool              `json:"isIdle"`
+	HasPendingMessages bool              `json:"hasPendingMessages"`
 }
 
 type ExecuteCommandResponse struct {
 	Handled bool         `json:"handled"`
 	Output  string       `json:"output,omitempty"`
 	Actions []HostAction `json:"actions,omitempty"`
+}
+
+type ExtensionUIRequest struct {
+	Type            string   `json:"type"`
+	ID              string   `json:"id"`
+	Method          string   `json:"method"`
+	Title           string   `json:"title,omitempty"`
+	Message         string   `json:"message,omitempty"`
+	Options         []string `json:"options,omitempty"`
+	Placeholder     string   `json:"placeholder,omitempty"`
+	Prefill         string   `json:"prefill,omitempty"`
+	Timeout         int      `json:"timeout,omitempty"`
+	NotifyType      string   `json:"notifyType,omitempty"`
+	StatusKey       string   `json:"statusKey,omitempty"`
+	StatusText      string   `json:"statusText,omitempty"`
+	WidgetKey       string   `json:"widgetKey,omitempty"`
+	WidgetLines     []string `json:"widgetLines,omitempty"`
+	WidgetPlacement string   `json:"widgetPlacement,omitempty"`
+	Text            string   `json:"text,omitempty"`
+}
+
+type ExtensionUIResponse struct {
+	ID        string `json:"id"`
+	Value     string `json:"value,omitempty"`
+	Confirmed *bool  `json:"confirmed,omitempty"`
+	Cancelled bool   `json:"cancelled,omitempty"`
 }
 
 type HostAction struct {
@@ -150,7 +215,12 @@ type HostAction struct {
 	SessionPath         string               `json:"sessionPath,omitempty"`
 	EntryID             string               `json:"entryId,omitempty"`
 	ParentSession       string               `json:"parentSession,omitempty"`
+	RequestID           string               `json:"requestId,omitempty"`
+	SetupEntries        []map[string]any     `json:"setupEntries,omitempty"`
 	Summarize           bool                 `json:"summarize,omitempty"`
 	CustomInstructions  string               `json:"customInstructions,omitempty"`
 	ReplaceInstructions bool                 `json:"replaceInstructions,omitempty"`
+	SkipBeforeHooks     bool                 `json:"skipBeforeHooks,omitempty"`
+	Summary             string               `json:"summary,omitempty"`
+	SummaryDetails      map[string]any       `json:"summaryDetails,omitempty"`
 }

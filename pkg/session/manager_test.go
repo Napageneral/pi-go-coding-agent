@@ -77,10 +77,10 @@ func TestAppendCompactionAndBranchSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append user failed: %v", err)
 	}
-	if _, err := sm.AppendCompaction("compact summary", userEntry.ID, 1234); err != nil {
+	if _, err := sm.AppendCompactionWithDetails("compact summary", userEntry.ID, 1234, map[string]any{"source": "test-compaction"}); err != nil {
 		t.Fatalf("append compaction failed: %v", err)
 	}
-	if _, err := sm.AppendBranchSummary(userEntry.ID, "branch summary"); err != nil {
+	if _, err := sm.AppendBranchSummaryWithDetails(userEntry.ID, "branch summary", map[string]any{"source": "test-branch"}); err != nil {
 		t.Fatalf("append branch summary failed: %v", err)
 	}
 
@@ -109,5 +109,85 @@ func TestAppendCompactionAndBranchSummary(t *testing.T) {
 	}
 	if !foundBranchSummary {
 		t.Fatal("expected branch summary in context messages")
+	}
+
+	var sawCompactionDetails bool
+	var sawBranchDetails bool
+	for _, e := range sm.Entries() {
+		switch e.Type {
+		case "compaction":
+			if e.Details != nil && e.Details["source"] == "test-compaction" {
+				sawCompactionDetails = true
+			}
+		case "branch_summary":
+			if e.Details != nil && e.Details["source"] == "test-branch" {
+				sawBranchDetails = true
+			}
+		}
+	}
+	if !sawCompactionDetails {
+		t.Fatal("expected compaction details to be persisted")
+	}
+	if !sawBranchDetails {
+		t.Fatal("expected branch summary details to be persisted")
+	}
+}
+
+func TestBuildContextCompactionKeepsTailOnly(t *testing.T) {
+	tmp := t.TempDir()
+	sm := NewManager(tmp)
+	if err := sm.CreateNew(tmp, ""); err != nil {
+		t.Fatalf("CreateNew failed: %v", err)
+	}
+
+	if _, err := sm.AppendMessage(types.TextMessage(types.RoleUser, "old-user")); err != nil {
+		t.Fatalf("append old user failed: %v", err)
+	}
+	if _, err := sm.AppendMessage(types.TextMessage(types.RoleAssistant, "old-assistant")); err != nil {
+		t.Fatalf("append old assistant failed: %v", err)
+	}
+	keepFrom, err := sm.AppendMessage(types.TextMessage(types.RoleUser, "keep-user"))
+	if err != nil {
+		t.Fatalf("append keep user failed: %v", err)
+	}
+	if _, err := sm.AppendMessage(types.TextMessage(types.RoleAssistant, "keep-assistant")); err != nil {
+		t.Fatalf("append keep assistant failed: %v", err)
+	}
+	if _, err := sm.AppendCompaction("compact-tail", keepFrom.ID, 42); err != nil {
+		t.Fatalf("append compaction failed: %v", err)
+	}
+	if _, err := sm.AppendMessage(types.TextMessage(types.RoleUser, "post-compaction")); err != nil {
+		t.Fatalf("append post-compaction failed: %v", err)
+	}
+
+	ctx := sm.BuildContext("", sm.LeafID(), nil)
+	has := func(needle string) bool {
+		for _, msg := range ctx.Messages {
+			for _, c := range msg.Content {
+				if c.Type == "text" && c.Text == needle {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	if !has("<summary>\ncompact-tail\n</summary>") {
+		t.Fatalf("expected compaction summary message")
+	}
+	if has("old-user") {
+		t.Fatalf("expected old-user to be omitted after compaction")
+	}
+	if has("old-assistant") {
+		t.Fatalf("expected old-assistant to be omitted after compaction")
+	}
+	if !has("keep-user") {
+		t.Fatalf("expected keep-user to remain after compaction")
+	}
+	if !has("keep-assistant") {
+		t.Fatalf("expected keep-assistant to remain after compaction")
+	}
+	if !has("post-compaction") {
+		t.Fatalf("expected post-compaction message to remain")
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,7 +50,7 @@ func TestClientInitializeEmitExecuteAndClose(t *testing.T) {
 	if len(initResp.Flags) != 1 || initResp.Flags[0].Name != "helper_mode" {
 		t.Fatalf("unexpected flags: %#v", initResp.Flags)
 	}
-	if len(initResp.Commands) != 1 || initResp.Commands[0].Name != "ping" {
+	if len(initResp.Commands) != 2 || initResp.Commands[0].Name != "ping" {
 		t.Fatalf("unexpected commands: %#v", initResp.Commands)
 	}
 	if len(initResp.Providers) != 1 || initResp.Providers[0].Name != "helper-provider" {
@@ -117,6 +118,59 @@ func TestClientInitializeEmitExecuteAndClose(t *testing.T) {
 	}
 }
 
+func TestClientExtensionUIRequestResponse(t *testing.T) {
+	client, err := Start(Options{
+		Command: os.Args[0],
+		Args:    []string{"-test.run=TestSidecarHelperProcess"},
+		Env:     []string{"GO_WANT_SIDECAR_HELPER=1"},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if _, err := client.Initialize(ctx, InitializeRequest{
+		ProtocolVersion: ProtocolVersion,
+		HasUI:           true,
+	}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	requests := make(chan ExtensionUIRequest, 1)
+	client.SetExtensionUIRequestHandler(func(req ExtensionUIRequest) {
+		select {
+		case requests <- req:
+		default:
+		}
+		_ = client.RespondExtensionUI(context.Background(), ExtensionUIResponse{
+			ID:    req.ID,
+			Value: "approved",
+		})
+	})
+
+	result, err := client.ExecuteCommand(ctx, "ask", "")
+	if err != nil {
+		t.Fatalf("ExecuteCommand(ask): %v", err)
+	}
+	if !result.Handled || result.Output != "asked:approved" {
+		t.Fatalf("unexpected ask command result: %#v", result)
+	}
+
+	select {
+	case req := <-requests:
+		if req.Method != "input" {
+			t.Fatalf("ui request method = %q, want input", req.Method)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected extension ui request callback")
+	}
+}
+
 func TestSidecarHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_SIDECAR_HELPER") != "1" {
 		return
@@ -177,6 +231,10 @@ func TestSidecarHelperProcess(t *testing.T) {
 						Name:        "ping",
 						Description: "Ping command",
 					},
+					{
+						Name:        "ask",
+						Description: "Ask for UI input",
+					},
 				},
 				Providers: []ProviderRegistration{
 					{
@@ -233,14 +291,61 @@ func TestSidecarHelperProcess(t *testing.T) {
 				writeError(t, encoder, req.ID, "invalid_request", err.Error())
 				continue
 			}
-			if cmdReq.Name != "ping" {
+			switch cmdReq.Name {
+			case "ping":
+				writeResult(t, encoder, req.ID, ExecuteCommandResponse{
+					Handled: true,
+					Output:  "pong:" + cmdReq.Args + " [" + helperMode + "]",
+				})
+			case "ask":
+				uiRequestID := "ui-helper-1"
+				if err := encoder.Encode(map[string]any{
+					"type":   "extension_ui_request",
+					"id":     uiRequestID,
+					"method": "input",
+					"title":  "helper input",
+				}); err != nil {
+					t.Fatalf("encode ui request: %v", err)
+				}
+				if !scanner.Scan() {
+					t.Fatalf("expected ui.respond request from host")
+				}
+				var uiReq struct {
+					ID     string          `json:"id"`
+					Method string          `json:"method"`
+					Params json.RawMessage `json:"params"`
+				}
+				if err := json.Unmarshal(scanner.Bytes(), &uiReq); err != nil {
+					t.Fatalf("decode ui.respond request: %v", err)
+				}
+				if uiReq.Method != "ui.respond" {
+					t.Fatalf("method = %q, want ui.respond", uiReq.Method)
+				}
+				var uiResp ExtensionUIResponse
+				if err := json.Unmarshal(uiReq.Params, &uiResp); err != nil {
+					t.Fatalf("decode ui.respond params: %v", err)
+				}
+				writeResult(t, encoder, uiReq.ID, map[string]any{"resolved": true})
+
+				output := "cancelled"
+				if !uiResp.Cancelled {
+					if strings.TrimSpace(uiResp.Value) != "" {
+						output = strings.TrimSpace(uiResp.Value)
+					} else if uiResp.Confirmed != nil {
+						if *uiResp.Confirmed {
+							output = "true"
+						} else {
+							output = "false"
+						}
+					}
+				}
+				writeResult(t, encoder, req.ID, ExecuteCommandResponse{
+					Handled: true,
+					Output:  "asked:" + output,
+				})
+			default:
 				writeError(t, encoder, req.ID, "command_not_found", "command not found")
-				continue
 			}
-			writeResult(t, encoder, req.ID, ExecuteCommandResponse{
-				Handled: true,
-				Output:  "pong:" + cmdReq.Args + " [" + helperMode + "]",
-			})
 		case "shutdown":
 			writeResult(t, encoder, req.ID, map[string]any{"ok": true})
 			return

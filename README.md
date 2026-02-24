@@ -14,22 +14,34 @@ Included:
 - Built-in tools: `read`, `write`, `edit`, `bash`, `ls`, `find`, `grep`
 - Provider adapters: OpenAI-compatible, Anthropic, Google, Bedrock (tool-calling supported)
 - CLI text/json mode
+- RPC mode (`--mode rpc`) with newline-delimited JSON command/response/event protocol
+  - includes `export_html` path export
+  - includes extension UI request/response bridge (`extension_ui_request` / `extension_ui_response`)
+  - includes runtime-backed auto-retry and auto-compaction controls (`set_auto_retry`, `abort_retry`, `set_auto_compaction`)
 
 Excluded from this module:
 - TUI
 - Upstream extension package manager/discovery/install behavior
-- RPC mode dependency
 
 Partially included:
 - Node extension sidecar runtime (protocol + event/tool bridge, not full upstream extension/package parity)
 - Upstream-style extension event payload fields for core lifecycle/tool hooks
 - Extension tool override path for built-in tool names
-- Extension action bridge for command/event driven messaging (`pi.sendUserMessage(...)`)
+- Extension action bridge for command/event driven messaging (`pi.sendUserMessage(...)`), including structured content blocks (`text`, `image`)
 - Extension action bridge for session metadata/state (`appendEntry`, `setSessionName`, `setLabel`) and active-tool updates
 - Command-context session control bridge (`newSession`, `switchSession`, `fork`, `navigateTree`) and sidecar-local `events.on/emit`
-- Session lifecycle hook parity path for `session_before_*` cancellation (`switch`, `fork`, `tree`) plus `session_switch`/`session_fork`/`session_tree` emissions
+- Session lineage semantics aligned with upstream (`parentSession` stored as session file path when provided)
+- `newSession({ setup })` setup-callback bridge (serialized setup operations replayed by host in the new session)
+- Session lifecycle hook parity path for `session_before_*` cancellation (`switch`, `fork`, `tree`) plus `session_switch`/`session_fork`/`session_tree` emissions and `session_shutdown` on runtime close
 - Sidecar command-context session field sync (`sessionId`/`sessionFile`/`sessionName`) via host `session_start` updates
 - Extension API compatibility shims for `registerMessageRenderer` (CLI no-op) and `exec(...)`
+- Command-context session methods now return upstream-style cancellation semantics when `session_before_*` handlers cancel (`{ cancelled: true }`)
+- Sidecar-local `ReadonlySessionManager` compatibility surface (`getCwd/getSessionDir/getSessionId/getSessionFile/getLeafId/getLeafEntry/getEntry/getLabel/getBranch/getHeader/getEntries/getTree/getSessionName`)
+- Sidecar `ctx` model/context compatibility surface (`ctx.model`, `ctx.modelRegistry`, `ctx.getSystemPrompt`, `ctx.isIdle`, `ctx.hasPendingMessages`)
+- Sidecar `ctx.modelRegistry` compatibility methods for common extensions (`find`, `getAvailable`, `getApiKey`, `getApiKeyForProvider`, `isUsingOAuth`)
+- Sidecar `ctx.getContextUsage()` compatibility snapshot (tokens/contextWindow/percent with post-compaction unknown-token behavior)
+- Sidecar `ctx.compact({ customInstructions })` bridge to host compaction action (`compact`), persisting `compaction` entries and emitting `session_compact`
+- Compaction lifecycle hook parity path for `session_before_compact` cancel/custom override handling
 
 ## Build
 
@@ -46,6 +58,7 @@ go run ./cmd/pi-go --provider anthropic --model claude-opus-4-6 "Summarize this 
 ```
 
 Flags:
+- `--mode` (`text` default, `rpc` for headless JSON protocol)
 - `--provider`
 - `--model`
 - `--api-key`
@@ -69,6 +82,20 @@ Behavior:
 - Runtime API supports queued `Steer(...)` and `FollowUp(...)` messages (pi-agent-like turn control semantics).
 - Prompt text beginning with `/` is treated as an extension command when registered by sidecar.
 - Runtime emits `model_select` when model is changed through runtime/CLI pathways.
+- Auto-retry and auto-compaction toggles in RPC mode now control active runtime behavior (not just stored flags).
+
+RPC mode:
+
+```bash
+go run ./cmd/pi-go --mode rpc --provider openai --model gpt-5.1-codex
+```
+
+- Send one JSON command per line on stdin.
+- Responses are JSON objects with `type: "response"`, `command`, `success`, optional `id`, and optional `data`/`error`.
+- Runtime lifecycle/tool/session events are streamed as JSON lines on stdout.
+- `get_commands` returns extension commands plus local prompt/skill commands discovered from:
+  - `~/.pi/agent/prompts`, `<cwd>/.pi/prompts`
+  - `~/.pi/agent/skills`, `<cwd>/.pi/skills`
 
 Node sidecar extension runtime:
 

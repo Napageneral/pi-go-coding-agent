@@ -138,6 +138,35 @@ func (a *AuthStorage) GetAPIKey(provider string) string {
 	return ""
 }
 
+func (a *AuthStorage) ProviderAuthType(provider string) string {
+	if _, ok := a.overrides[provider]; ok {
+		return "api_key"
+	}
+	if c, ok := a.data[provider]; ok {
+		switch c.Type {
+		case "oauth":
+			if c.AccessToken != "" || c.Access != "" {
+				return "oauth"
+			}
+		case "api_key":
+			if c.Key != "" {
+				return "api_key"
+			}
+		}
+	}
+	if env := envAPIKey(provider); env != "" {
+		return "api_key"
+	}
+	if a.fallback != nil && a.fallback(provider) != "" {
+		return "api_key"
+	}
+	return ""
+}
+
+func (a *AuthStorage) IsUsingOAuth(provider string) bool {
+	return a.ProviderAuthType(provider) == "oauth"
+}
+
 func resolveConfigValue(v string) string {
 	if strings.HasPrefix(v, "$") {
 		return os.Getenv(strings.TrimPrefix(v, "$"))

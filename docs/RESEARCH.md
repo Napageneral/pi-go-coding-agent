@@ -4,7 +4,7 @@
 
 Desired UX for your projects:
 - Native Go binary.
-- No RPC dependency.
+- Optional RPC mode for headless clients.
 - Persistent sessions with branchable history.
 - Reliable tool-call loop for coding workflows.
 - Provider/model selection at runtime.
@@ -15,6 +15,7 @@ What you explicitly do **not** need for this phase:
 
 What is now in scope:
 - Node sidecar runtime for extensions.
+- RPC mode parity for coding-agent control workflows (`prompt`/queue/session/model/thinking/state/bash commands).
 - Go host lifecycle/event and tool bridge to sidecar.
 - Agent-loop parity behaviors from `packages/agent` that matter for coding runtime control:
   - steering queue interruption semantics.
@@ -85,13 +86,29 @@ High-impact upstream compatibility points now treated as first-class:
 - `model_select` lifecycle emission when model changes via runtime API.
 - Extension tool override precedence for built-in tool names (e.g. extension `read` overrides built-in `read`).
 - Action bridge for extension commands/events so `pi.sendUserMessage(...)` can queue/trigger native Go turns.
+- `pi.sendUserMessage(...)` bridge now preserves structured content blocks (including `image` blocks) across sidecar -> host action dispatch.
 - Session metadata/state action parity for extension commands (`appendEntry`, `setSessionName`, `setLabel`).
 - Active-tool control parity path (`setActiveTools`) with host-side context filtering and inactive-tool enforcement.
 - Session-control command-context parity path (`newSession`, `switchSession`, `fork`, `navigateTree`) in CLI mode.
 - Session lifecycle hook parity path for extension-driven session control:
   - `session_before_switch`/`session_before_fork`/`session_before_tree` cancel handling in host runtime.
   - `session_switch`/`session_fork`/`session_tree` notifications emitted after state transitions.
+- Session lineage parity: session header `parentSession` now follows upstream path semantics (session file path, not session ID).
+- `newSession({ setup })` parity path now serializes setup-callback SessionManager mutations in sidecar and replays them in host after session creation.
+- Command-context cancellation parity now uses sidecar-local `session_before_*` evaluation before dispatching host actions, so command handlers receive upstream-style `{ cancelled: true }` results.
 - Sidecar command-context session field sync from host `session_start` events.
+- `session_before_tree` summary overrides now bridge end-to-end from sidecar command hooks into host session persistence (`branch_summary` entries).
+- Sidecar now maintains a synchronized local session mirror sufficient for upstream-style `ReadonlySessionManager` methods in extension contexts.
+- Sidecar session mirror now applies compaction entries incrementally from `session_compact` events (not just message events), so `ctx.sessionManager` stays in sync after programmatic compaction.
+- Sidecar now receives host context snapshots for extension `ctx` model surfaces (`ctx.model`, `ctx.getSystemPrompt`, `ctx.isIdle`, `ctx.hasPendingMessages`) across initialize/command/event paths.
+- Sidecar `ctx.modelRegistry` now includes common upstream methods (`find`, `getAvailable`, `getApiKey`, `getApiKeyForProvider`) backed by host model snapshots and provider API-key sync.
+- Sidecar `ctx.modelRegistry.isUsingOAuth(model)` now reflects host auth-mode snapshots (`oauth` vs `api_key`) instead of a hardcoded false fallback.
+- Sidecar now receives host context-usage snapshots for `ctx.getContextUsage()` and keeps post-compaction token visibility aligned with upstream semantics (unknown until next assistant usage).
+- Sidecar `ctx.compact({ customInstructions })` now bridges to a host `compact` action path that persists `compaction` entries and emits `session_compact`.
+- Compaction hook parity now includes `session_before_compact` evaluation (cancel/custom compaction override) before host summary generation.
+- Custom compaction/branch-summary `details` payloads from extension hooks are now preserved in persisted session entries (`compaction.details`, `branch_summary.details`).
+- Runtime close now emits `session_shutdown` to sidecar for upstream lifecycle parity.
+- Session context reconstruction now honors persisted `compaction.firstKeptEntryId` semantics so compaction entries actually reduce pre-compaction message replay.
 - Compatibility shims for upstream extension APIs commonly used by extensions:
   - `pi.exec(...)` (spawn + stdout/stderr/code/killed result)
   - `pi.registerMessageRenderer(...)` (no-op in CLI mode)
@@ -100,3 +117,42 @@ High-impact upstream compatibility points now treated as first-class:
 Still intentionally deferred:
 - Full interactive UI context parity and cross-process/runtime event bus parity.
 - Upstream package-manager/discovery/install behavior for extensions.
+
+## 7. RPC Parity Notes
+
+Upstream reference:
+- `packages/coding-agent/src/modes/rpc/rpc-mode.ts`
+- `packages/coding-agent/src/modes/rpc/rpc-types.ts`
+- `packages/coding-agent/docs/rpc.md`
+
+Key protocol findings:
+- Command transport is newline-delimited JSON on stdin.
+- Responses use `{ type: "response", command, success, id?, data?/error? }`.
+- Events are streamed continuously during agent activity.
+- `prompt` is asynchronous; command loop must stay responsive while events stream.
+- Queue behavior matters while streaming:
+  - `streamingBehavior: "steer"` interrupts after current tool execution.
+  - `streamingBehavior: "followUp"` appends a follow-up message.
+- Queue delivery modes are explicit and runtime-configurable:
+  - `all`
+  - `one-at-a-time`
+- RPC `export_html` returns a path and writes session HTML.
+- Extension UI dialog flow is asynchronous over RPC:
+  - runtime emits `extension_ui_request`
+  - client replies with `extension_ui_response` (value/confirmed/cancelled)
+
+Complications for Go implementation:
+- Runtime needed a first-class event subscription surface independent of extension sidecar presence.
+- Session control methods (`new/switch/fork/compact`) existed but were private; RPC needs exported API wrappers.
+- Runtime queue dequeue logic was previously fixed to one-at-a-time, requiring mode-aware dequeue behavior.
+- Bash command parity needed structured result fields (`output`, `exitCode`, `cancelled`, `truncated`) and abort hooks.
+- `get_commands` parity required a native command catalog in Go:
+  - extension commands from sidecar initialization metadata,
+  - prompt templates from user/project default prompt directories,
+  - skills from user/project default skills directories.
+
+Closed parity gaps in current Go runtime:
+- `export_html` is implemented and returns `{ path }`.
+- `extension_ui_response` is now wired to sidecar UI request resolution (no longer ignored).
+- `set_auto_retry` / `abort_retry` now control active retry behavior (bounded backoff + cancellation).
+- `set_auto_compaction` now controls active auto-compaction behavior (threshold and overflow recovery paths).

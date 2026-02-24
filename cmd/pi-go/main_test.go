@@ -19,6 +19,9 @@ func TestParseCLIArgsKnownAndExtensionFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseCLIArgs: %v", err)
 	}
+	if opts.Mode != "text" {
+		t.Fatalf("mode = %q, want text", opts.Mode)
+	}
 	if opts.Provider != "openai" || opts.Model != "gpt-test" {
 		t.Fatalf("unexpected provider/model: %#v", opts)
 	}
@@ -52,5 +55,22 @@ func TestParseCLIArgsMissingValue(t *testing.T) {
 	_, err := parseCLIArgs([]string{"--provider"})
 	if err == nil {
 		t.Fatal("expected missing value error")
+	}
+}
+
+func TestParseCLIArgsRPCMode(t *testing.T) {
+	opts, err := parseCLIArgs([]string{"--mode", "rpc"})
+	if err != nil {
+		t.Fatalf("parseCLIArgs: %v", err)
+	}
+	if opts.Mode != "rpc" {
+		t.Fatalf("mode = %q, want rpc", opts.Mode)
+	}
+}
+
+func TestParseCLIArgsInvalidMode(t *testing.T) {
+	_, err := parseCLIArgs([]string{"--mode", "unknown"})
+	if err == nil {
+		t.Fatal("expected invalid mode error")
 	}
 }

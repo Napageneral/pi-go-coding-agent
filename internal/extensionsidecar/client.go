@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,6 +69,9 @@ type Client struct {
 	doneOnce sync.Once
 	done     chan struct{}
 	doneErr  error
+
+	notifyMu             sync.Mutex
+	onExtensionUIRequest func(ExtensionUIRequest)
 }
 
 func Start(opts Options) (*Client, error) {
@@ -147,8 +151,11 @@ func (c *Client) ExecuteTool(ctx context.Context, name, callID string, args map[
 }
 
 func (c *Client) ExecuteCommand(ctx context.Context, name, args string) (ExecuteCommandResponse, error) {
+	return c.ExecuteCommandWithRequest(ctx, ExecuteCommandRequest{Name: name, Args: args})
+}
+
+func (c *Client) ExecuteCommandWithRequest(ctx context.Context, req ExecuteCommandRequest) (ExecuteCommandResponse, error) {
 	var result ExecuteCommandResponse
-	req := ExecuteCommandRequest{Name: name, Args: args}
 	if err := c.call(ctx, "command.execute", req, &result); err != nil {
 		var rpcErr *rpcError
 		if errors.As(err, &rpcErr) && rpcErr.Code == "command_not_found" {
@@ -157,6 +164,20 @@ func (c *Client) ExecuteCommand(ctx context.Context, name, args string) (Execute
 		return ExecuteCommandResponse{}, err
 	}
 	return result, nil
+}
+
+func (c *Client) SetExtensionUIRequestHandler(handler func(ExtensionUIRequest)) {
+	c.notifyMu.Lock()
+	c.onExtensionUIRequest = handler
+	c.notifyMu.Unlock()
+}
+
+func (c *Client) RespondExtensionUI(ctx context.Context, response ExtensionUIResponse) error {
+	response.ID = strings.TrimSpace(response.ID)
+	if response.ID == "" {
+		return errors.New("extension ui response id is required")
+	}
+	return c.call(ctx, "ui.respond", response, nil)
 }
 
 func (c *Client) Close() error {
@@ -242,6 +263,10 @@ func (c *Client) readLoop(stdout io.Reader) {
 		if len(line) == 0 {
 			continue
 		}
+		if req, ok := parseExtensionUIRequest(line); ok {
+			c.notifyExtensionUIRequest(req)
+			continue
+		}
 		var resp responseEnvelope
 		if err := json.Unmarshal(line, &resp); err != nil {
 			continue
@@ -262,6 +287,32 @@ func (c *Client) readLoop(stdout io.Reader) {
 	if err := scanner.Err(); err != nil {
 		c.finish(err)
 	}
+}
+
+func parseExtensionUIRequest(line []byte) (ExtensionUIRequest, bool) {
+	var req ExtensionUIRequest
+	if err := json.Unmarshal(line, &req); err != nil {
+		return ExtensionUIRequest{}, false
+	}
+	if !strings.EqualFold(strings.TrimSpace(req.Type), "extension_ui_request") {
+		return ExtensionUIRequest{}, false
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	req.Method = strings.TrimSpace(req.Method)
+	if req.ID == "" || req.Method == "" {
+		return ExtensionUIRequest{}, false
+	}
+	return req, true
+}
+
+func (c *Client) notifyExtensionUIRequest(req ExtensionUIRequest) {
+	c.notifyMu.Lock()
+	handler := c.onExtensionUIRequest
+	c.notifyMu.Unlock()
+	if handler == nil {
+		return
+	}
+	go handler(req)
 }
 
 func (c *Client) waitLoop() {

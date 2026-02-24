@@ -209,6 +209,13 @@ func (m *ModelRegistry) GetAPIKey(provider string) string {
 	return m.auth.GetAPIKey(provider)
 }
 
+func (m *ModelRegistry) IsUsingOAuth(provider string) bool {
+	if m.auth == nil {
+		return false
+	}
+	return m.auth.IsUsingOAuth(provider)
+}
+
 func (m *ModelRegistry) GetAvailable() []types.Model {
 	if m.auth == nil {
 		return m.GetAll()

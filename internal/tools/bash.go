@@ -3,6 +3,7 @@ package tools
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
@@ -80,9 +81,32 @@ func (t *BashTool) Execute(ctx context.Context, _ string, args map[string]interf
 		truncated = true
 	}
 
+	exitCode := 0
+	cancelled := false
+	if err != nil {
+		var exitErr *exec.ExitError
+		switch {
+		case errors.As(err, &exitErr):
+			exitCode = exitErr.ExitCode()
+		case errors.Is(ctx.Err(), context.Canceled):
+			exitCode = 130
+			cancelled = true
+		default:
+			exitCode = 1
+		}
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		cancelled = true
+		if exitCode == 0 {
+			exitCode = 124
+		}
+	}
+
 	details := map[string]any{
 		"cwd":       t.cwd,
 		"truncated": truncated,
+		"exitCode":  exitCode,
+		"cancelled": cancelled,
 	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return types.ToolResult{IsError: true, Content: []types.ContentBlock{{Type: "text", Text: combined + "\n\nCommand timed out"}}, Details: details}, fmt.Errorf("command timed out")

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -20,19 +21,43 @@ import (
 )
 
 type Runtime struct {
-	session       *session.Manager
-	tools         *tools.Registry
-	activeTools   map[string]struct{}
-	modelRegistry *config.ModelRegistry
-	auth          *config.AuthStorage
-	model         types.Model
-	thinkingLevel string
-	systemPrompt  string
-	sidecar       *extensionsidecar.Client
-	steeringQueue []types.Message
-	followUpQueue []types.Message
-	mu            sync.Mutex
-	abortRun      context.CancelFunc
+	session               *session.Manager
+	tools                 *tools.Registry
+	activeTools           map[string]struct{}
+	modelRegistry         *config.ModelRegistry
+	auth                  *config.AuthStorage
+	model                 types.Model
+	thinkingLevel         string
+	systemPrompt          string
+	sidecar               *extensionsidecar.Client
+	extensionCommands     []extensionsidecar.ExtensionCommandDefinition
+	extensionUIEnabled    bool
+	steeringQueue         []types.Message
+	followUpQueue         []types.Message
+	steeringMode          string
+	followUpMode          string
+	autoCompactionEnabled bool
+	autoRetryEnabled      bool
+	mu                    sync.Mutex
+	abortRun              context.CancelFunc
+	abortBash             context.CancelFunc
+	abortRetry            context.CancelFunc
+
+	eventSubscribers      map[int]func(RuntimeEvent)
+	nextEventSubscriberID int
+}
+
+type RuntimeEvent struct {
+	Type    string         `json:"type"`
+	Payload map[string]any `json:"payload,omitempty"`
+}
+
+type Command struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Source      string `json:"source"`
+	Location    string `json:"location,omitempty"`
+	Path        string `json:"path,omitempty"`
 }
 
 type NewRuntimeOptions struct {
@@ -50,6 +75,7 @@ type NewRuntimeOptions struct {
 	ExtensionSidecarEnv     []string
 	ExtensionPaths          []string
 	ExtensionFlagValues     map[string]any
+	EnableExtensionUI       bool
 }
 
 func NewRuntime(opts NewRuntimeOptions) (*Runtime, error) {
@@ -107,14 +133,20 @@ func NewRuntime(opts NewRuntimeOptions) (*Runtime, error) {
 	}
 
 	r := &Runtime{
-		session:       sm,
-		tools:         tools.NewCodingRegistry(absCWD),
-		activeTools:   map[string]struct{}{},
-		modelRegistry: registry,
-		auth:          auth,
-		model:         model,
-		thinkingLevel: "medium",
-		systemPrompt:  defaultSystemPrompt(opts.SystemPrompt),
+		session:               sm,
+		tools:                 tools.NewCodingRegistry(absCWD),
+		activeTools:           map[string]struct{}{},
+		modelRegistry:         registry,
+		auth:                  auth,
+		model:                 model,
+		thinkingLevel:         "medium",
+		systemPrompt:          defaultSystemPrompt(opts.SystemPrompt),
+		extensionUIEnabled:    opts.EnableExtensionUI,
+		steeringMode:          queueModeOneAtATime,
+		followUpMode:          queueModeOneAtATime,
+		autoCompactionEnabled: true,
+		autoRetryEnabled:      true,
+		eventSubscribers:      map[int]func(RuntimeEvent){},
 	}
 	r.resetActiveToolsToAll()
 	if err := r.initExtensionSidecar(absCWD, opts); err != nil {
@@ -132,7 +164,11 @@ func defaultSystemPrompt(override string) string {
 }
 
 func (r *Runtime) Session() *session.Manager { return r.session }
-func (r *Runtime) Model() types.Model        { return r.model }
+func (r *Runtime) Model() types.Model {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.model
+}
 
 func (r *Runtime) Close() error {
 	r.mu.Lock()
@@ -140,6 +176,9 @@ func (r *Runtime) Close() error {
 	r.sidecar = nil
 	r.mu.Unlock()
 	if sidecar != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		_, _ = sidecar.Emit(shutdownCtx, extensionsidecar.Event{Type: "session_shutdown"})
+		cancel()
 		return sidecar.Close()
 	}
 	return nil
@@ -150,12 +189,13 @@ func (r *Runtime) SetModel(provider, modelID string) error {
 	if err != nil {
 		return err
 	}
-	previous := r.model
-	r.model = model
-	_, err = r.session.AppendModelChange(provider, modelID)
-	if err != nil {
+	previous := r.Model()
+	if _, err := r.session.AppendModelChange(provider, modelID); err != nil {
 		return err
 	}
+	r.mu.Lock()
+	r.model = model
+	r.mu.Unlock()
 	payload := map[string]any{
 		"model":  model,
 		"source": "set",
@@ -168,6 +208,175 @@ func (r *Runtime) SetModel(provider, modelID string) error {
 		Payload: payload,
 	})
 	return nil
+}
+
+func (r *Runtime) AvailableModels() []types.Model {
+	return r.modelRegistry.GetAvailable()
+}
+
+func (r *Runtime) CycleModel() (*types.Model, bool, error) {
+	models := r.AvailableModels()
+	if len(models) <= 1 {
+		return nil, false, nil
+	}
+	current := r.Model()
+	index := -1
+	for i, model := range models {
+		if strings.EqualFold(model.Provider, current.Provider) && strings.EqualFold(model.ID, current.ID) {
+			index = i
+			break
+		}
+	}
+	next := models[0]
+	if index >= 0 {
+		next = models[(index+1)%len(models)]
+	}
+	if err := r.SetModel(next.Provider, next.ID); err != nil {
+		return nil, false, err
+	}
+	return &next, false, nil
+}
+
+func (r *Runtime) ThinkingLevel() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.thinkingLevel
+}
+
+func (r *Runtime) SetThinkingLevel(level string) error {
+	level = strings.TrimSpace(level)
+	if level == "" {
+		return errors.New("thinking level is empty")
+	}
+	if _, err := r.session.AppendThinkingLevel(level); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.thinkingLevel = level
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *Runtime) CycleThinkingLevel() (string, bool, error) {
+	current := strings.ToLower(strings.TrimSpace(r.ThinkingLevel()))
+	if current == "" {
+		return "", false, nil
+	}
+	index := -1
+	for i, level := range thinkingLevelCycle {
+		if level == current {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return "", false, nil
+	}
+	next := thinkingLevelCycle[(index+1)%len(thinkingLevelCycle)]
+	if err := r.SetThinkingLevel(next); err != nil {
+		return "", false, err
+	}
+	return next, true, nil
+}
+
+func (r *Runtime) SetSteeringMode(mode string) error {
+	normalized, err := normalizeQueueMode(mode)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.steeringMode = normalized
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *Runtime) SetFollowUpMode(mode string) error {
+	normalized, err := normalizeQueueMode(mode)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.followUpMode = normalized
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *Runtime) SteeringMode() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.steeringMode
+}
+
+func (r *Runtime) FollowUpMode() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.followUpMode
+}
+
+func (r *Runtime) IsStreaming() bool {
+	return !r.runtimeIsIdle()
+}
+
+func (r *Runtime) PendingMessageCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.steeringQueue) + len(r.followUpQueue)
+}
+
+func (r *Runtime) SessionFile() string { return r.session.SessionFile() }
+func (r *Runtime) SessionID() string   { return r.session.SessionID() }
+func (r *Runtime) SessionName() string { return r.session.SessionName() }
+
+func (r *Runtime) SetAutoCompactionEnabled(enabled bool) {
+	r.mu.Lock()
+	r.autoCompactionEnabled = enabled
+	r.mu.Unlock()
+}
+
+func (r *Runtime) AutoCompactionEnabled() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.autoCompactionEnabled
+}
+
+func (r *Runtime) SetAutoRetryEnabled(enabled bool) {
+	r.mu.Lock()
+	r.autoRetryEnabled = enabled
+	r.mu.Unlock()
+}
+
+func (r *Runtime) AutoRetryEnabled() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.autoRetryEnabled
+}
+
+func (r *Runtime) AbortRetry() {
+	r.mu.Lock()
+	cancel := r.abortRetry
+	r.abortRetry = nil
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (r *Runtime) RespondExtensionUI(response extensionsidecar.ExtensionUIResponse) error {
+	response.ID = strings.TrimSpace(response.ID)
+	if response.ID == "" {
+		return errors.New("extension ui response id is required")
+	}
+
+	r.mu.Lock()
+	sidecar := r.sidecar
+	r.mu.Unlock()
+	if sidecar == nil {
+		return errors.New("extension sidecar is not enabled")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), extensionUIResponseTimeout)
+	defer cancel()
+	return sidecar.RespondExtensionUI(ctx, response)
 }
 
 func (r *Runtime) Prompt(text string) (types.Message, error) {
@@ -197,6 +406,25 @@ func (r *Runtime) Prompt(text string) (types.Message, error) {
 	return r.runLoop()
 }
 
+func (r *Runtime) PromptMessage(message types.Message) (types.Message, error) {
+	if message.Role == "" {
+		message.Role = types.RoleUser
+	}
+	if message.Role != types.RoleUser {
+		return types.Message{}, fmt.Errorf("prompt message role must be %s", types.RoleUser)
+	}
+	if !hasMessageContent(message.Content) {
+		return types.Message{}, errors.New("prompt message content is empty")
+	}
+	if message.Timestamp == 0 {
+		message.Timestamp = types.NowMillis()
+	}
+	if err := r.appendSessionMessageWithEvents(context.Background(), message); err != nil {
+		return types.Message{}, err
+	}
+	return r.runLoop()
+}
+
 var ErrAborted = errors.New("run aborted")
 
 func (r *Runtime) Continue() (types.Message, error) {
@@ -217,8 +445,24 @@ func (r *Runtime) Steer(text string) error {
 	if text == "" {
 		return errors.New("steer text is empty")
 	}
+	return r.SteerMessage(types.TextMessage(types.RoleUser, text))
+}
+
+func (r *Runtime) SteerMessage(message types.Message) error {
+	if message.Role == "" {
+		message.Role = types.RoleUser
+	}
+	if message.Role != types.RoleUser {
+		return fmt.Errorf("steer message role must be %s", types.RoleUser)
+	}
+	if !hasMessageContent(message.Content) {
+		return errors.New("steer message content is empty")
+	}
+	if message.Timestamp == 0 {
+		message.Timestamp = types.NowMillis()
+	}
 	r.mu.Lock()
-	r.steeringQueue = append(r.steeringQueue, types.TextMessage(types.RoleUser, text))
+	r.steeringQueue = append(r.steeringQueue, message)
 	r.mu.Unlock()
 	return nil
 }
@@ -228,8 +472,24 @@ func (r *Runtime) FollowUp(text string) error {
 	if text == "" {
 		return errors.New("follow-up text is empty")
 	}
+	return r.FollowUpMessage(types.TextMessage(types.RoleUser, text))
+}
+
+func (r *Runtime) FollowUpMessage(message types.Message) error {
+	if message.Role == "" {
+		message.Role = types.RoleUser
+	}
+	if message.Role != types.RoleUser {
+		return fmt.Errorf("follow-up message role must be %s", types.RoleUser)
+	}
+	if !hasMessageContent(message.Content) {
+		return errors.New("follow-up message content is empty")
+	}
+	if message.Timestamp == 0 {
+		message.Timestamp = types.NowMillis()
+	}
 	r.mu.Lock()
-	r.followUpQueue = append(r.followUpQueue, types.TextMessage(types.RoleUser, text))
+	r.followUpQueue = append(r.followUpQueue, message)
 	r.mu.Unlock()
 	return nil
 }
@@ -242,9 +502,52 @@ func (r *Runtime) hasQueuedMessages() bool {
 
 func (r *Runtime) Abort() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.abortRun != nil {
-		r.abortRun()
+	cancelRun := r.abortRun
+	cancelRetry := r.abortRetry
+	r.abortRetry = nil
+	r.mu.Unlock()
+	if cancelRun != nil {
+		cancelRun()
+	}
+	if cancelRetry != nil {
+		cancelRetry()
+	}
+}
+
+func (r *Runtime) ExecuteBash(command string) (types.ToolResult, error) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return types.ToolResult{IsError: true}, errors.New("bash command is empty")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	r.mu.Lock()
+	if r.abortBash != nil {
+		r.mu.Unlock()
+		cancel()
+		return types.ToolResult{IsError: true}, errors.New("bash command already running")
+	}
+	r.abortBash = cancel
+	r.mu.Unlock()
+
+	defer func() {
+		r.mu.Lock()
+		r.abortBash = nil
+		r.mu.Unlock()
+		cancel()
+	}()
+
+	return r.tools.Execute(ctx, "bash", "rpc_bash", map[string]interface{}{
+		"command": command,
+	})
+}
+
+func (r *Runtime) AbortBash() {
+	r.mu.Lock()
+	cancel := r.abortBash
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -282,6 +585,7 @@ func (r *Runtime) runLoop() (types.Message, error) {
 		ctxState := r.session.BuildContext(activeSystemPrompt, r.session.LeafID(), r.currentToolsDefinitions())
 		promptText = latestUserPromptText(ctxState.Messages)
 	}
+	retryAttempt := 0
 
 	if result, ok := r.emitEventBestEffort(runCtx, extensionsidecar.Event{
 		Type: "before_agent_start",
@@ -332,6 +636,9 @@ func (r *Runtime) runLoop() (types.Message, error) {
 			}
 			pendingMessages = nil
 		}
+		if r.AutoCompactionEnabled() {
+			_, _ = r.maybeAutoCompactThreshold(runCtx)
+		}
 
 		_, _ = r.emitEventBestEffort(runCtx, extensionsidecar.Event{
 			Type: "turn_start",
@@ -366,7 +673,41 @@ func (r *Runtime) runLoop() (types.Message, error) {
 			if errors.Is(err, context.Canceled) || errors.Is(runCtx.Err(), context.Canceled) {
 				return lastAssistant, ErrAborted
 			}
+			if r.AutoCompactionEnabled() && isContextOverflowProviderError(err) {
+				if compacted, _ := r.runAutoCompaction(runCtx, "overflow", true, err); compacted {
+					retryAttempt = 0
+					continue
+				}
+			}
+			if r.AutoRetryEnabled() && isRetryableProviderError(err) {
+				attempt := retryAttempt + 1
+				if attempt > autoRetryMaxAttempts {
+					r.emitAutoRetryEnd(retryAttempt, false, err.Error())
+					retryAttempt = 0
+					return lastAssistant, err
+				}
+				retryAttempt = attempt
+				delay := autoRetryBaseDelay * time.Duration(1<<(attempt-1))
+				r.emitAutoRetryStart(attempt, autoRetryMaxAttempts, delay, err.Error())
+				if cancelled := r.waitForRetryDelay(runCtx, delay); cancelled {
+					r.emitAutoRetryEnd(attempt, false, "Retry cancelled")
+					retryAttempt = 0
+					if errors.Is(runCtx.Err(), context.Canceled) {
+						return lastAssistant, ErrAborted
+					}
+					return lastAssistant, err
+				}
+				continue
+			}
+			if retryAttempt > 0 {
+				r.emitAutoRetryEnd(retryAttempt, false, err.Error())
+				retryAttempt = 0
+			}
 			return lastAssistant, err
+		}
+		if retryAttempt > 0 {
+			r.emitAutoRetryEnd(retryAttempt, true, "")
+			retryAttempt = 0
 		}
 		lastAssistant = resp.Assistant
 		if err := r.appendSessionMessageWithEvents(runCtx, resp.Assistant); err != nil {
@@ -605,19 +946,40 @@ func (r *Runtime) initExtensionSidecar(cwd string, opts NewRuntimeOptions) error
 	if err != nil {
 		return err
 	}
+	client.SetExtensionUIRequestHandler(func(req extensionsidecar.ExtensionUIRequest) {
+		r.emitRuntimeEvent(RuntimeEvent{
+			Type:    "extension_ui_request",
+			Payload: extensionUIRequestPayload(req),
+		})
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	initResp, err := client.Initialize(ctx, extensionsidecar.InitializeRequest{
-		ProtocolVersion: extensionsidecar.ProtocolVersion,
-		CWD:             cwd,
-		SessionID:       r.session.SessionID(),
-		SessionFile:     r.session.SessionFile(),
-		SessionName:     r.session.SessionName(),
-		HostTools:       r.tools.Definitions(),
-		ActiveTools:     r.currentActiveToolNames(),
-		ExtensionPaths:  opts.ExtensionPaths,
-		FlagValues:      opts.ExtensionFlagValues,
+		ProtocolVersion:    extensionsidecar.ProtocolVersion,
+		CWD:                cwd,
+		SessionID:          r.session.SessionID(),
+		SessionFile:        r.session.SessionFile(),
+		SessionDir:         r.session.SessionDir(),
+		SessionName:        r.session.SessionName(),
+		LeafID:             r.session.LeafID(),
+		SessionHeader:      sessionHeaderMap(r.session.Header()),
+		SessionEntries:     sessionEntriesMaps(r.session.Entries()),
+		CurrentModel:       &r.model,
+		AllModels:          r.modelRegistry.GetAll(),
+		AvailableModels:    r.modelRegistry.GetAvailable(),
+		ProviderAPIKeys:    r.sidecarProviderAPIKeys(),
+		ProviderAuthTypes:  r.sidecarProviderAuthTypes(),
+		ContextUsage:       r.contextUsageSnapshot(),
+		SystemPrompt:       r.systemPrompt,
+		ThinkingLevel:      r.thinkingLevel,
+		IsIdle:             r.runtimeIsIdle(),
+		HasPendingMessages: r.hasQueuedMessages(),
+		HostTools:          r.tools.Definitions(),
+		ActiveTools:        r.currentActiveToolNames(),
+		ExtensionPaths:     opts.ExtensionPaths,
+		FlagValues:         opts.ExtensionFlagValues,
+		HasUI:              opts.EnableExtensionUI,
 	})
 	if err != nil {
 		_ = client.Close()
@@ -633,6 +995,7 @@ func (r *Runtime) initExtensionSidecar(cwd string, opts NewRuntimeOptions) error
 	}
 
 	r.sidecar = client
+	r.extensionCommands = append([]extensionsidecar.ExtensionCommandDefinition(nil), initResp.Commands...)
 	for _, reg := range initResp.Providers {
 		if strings.TrimSpace(reg.Name) == "" || reg.Config == nil {
 			continue
@@ -677,12 +1040,26 @@ func (r *Runtime) emitSessionStartEvent(client *extensionsidecar.Client) error {
 	_, err := client.Emit(emitCtx, extensionsidecar.Event{
 		Type: "session_start",
 		Payload: map[string]any{
-			"sessionId":   r.session.SessionID(),
-			"sessionFile": r.session.SessionFile(),
-			"sessionName": r.session.SessionName(),
-			"cwd":         r.session.CWD(),
-			"hostTools":   r.tools.Definitions(),
-			"activeTools": r.currentActiveToolNames(),
+			"sessionId":          r.session.SessionID(),
+			"sessionFile":        r.session.SessionFile(),
+			"sessionDir":         r.session.SessionDir(),
+			"sessionName":        r.session.SessionName(),
+			"leafId":             r.session.LeafID(),
+			"cwd":                r.session.CWD(),
+			"sessionHeader":      sessionHeaderMap(r.session.Header()),
+			"sessionEntries":     sessionEntriesMaps(r.session.Entries()),
+			"currentModel":       r.model,
+			"allModels":          r.modelRegistry.GetAll(),
+			"availableModels":    r.modelRegistry.GetAvailable(),
+			"providerApiKeys":    r.sidecarProviderAPIKeys(),
+			"providerAuthTypes":  r.sidecarProviderAuthTypes(),
+			"contextUsage":       r.contextUsageSnapshot(),
+			"systemPrompt":       r.systemPrompt,
+			"thinkingLevel":      r.thinkingLevel,
+			"isIdle":             r.runtimeIsIdle(),
+			"hasPendingMessages": r.hasQueuedMessages(),
+			"hostTools":          r.tools.Definitions(),
+			"activeTools":        r.currentActiveToolNames(),
 		},
 	})
 	return err
@@ -727,20 +1104,82 @@ func (r *Runtime) applyInputHooks(text string) (string, *types.Message, error) {
 }
 
 func (r *Runtime) emitEventBestEffort(ctx context.Context, event extensionsidecar.Event) (extensionsidecar.EmitResponse, bool) {
-	if r.sidecar == nil {
-		return extensionsidecar.EmitResponse{}, false
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if event.Payload == nil {
+		event.Payload = map[string]any{}
+	}
+	event.Payload["ctxModel"] = r.Model()
+	event.Payload["ctxSystemPrompt"] = r.systemPrompt
+	event.Payload["ctxThinkingLevel"] = r.ThinkingLevel()
+	event.Payload["ctxIsIdle"] = r.runtimeIsIdle()
+	event.Payload["ctxHasPendingMessages"] = r.hasQueuedMessages()
+	event.Payload["ctxProviderAuthTypes"] = r.sidecarProviderAuthTypes()
+	event.Payload["ctxContextUsage"] = r.contextUsageSnapshot()
+
+	r.emitRuntimeEvent(RuntimeEvent{
+		Type:    event.Type,
+		Payload: anyMap(event.Payload),
+	})
+
+	r.mu.Lock()
+	sidecar := r.sidecar
+	r.mu.Unlock()
+	if sidecar == nil {
+		return extensionsidecar.EmitResponse{}, false
+	}
 	timeoutCtx, cancel := context.WithTimeout(ctx, extensionEventTimeout)
 	defer cancel()
-	result, err := r.sidecar.Emit(timeoutCtx, event)
+	result, err := sidecar.Emit(timeoutCtx, event)
 	if err != nil {
 		return extensionsidecar.EmitResponse{}, false
 	}
 	_, _, _ = r.applySidecarActions(context.Background(), result.Actions, false)
 	return result, true
+}
+
+func (r *Runtime) runtimeIsIdle() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.abortRun == nil
+}
+
+func (r *Runtime) SubscribeEvents(listener func(RuntimeEvent)) func() {
+	if listener == nil {
+		return func() {}
+	}
+	r.mu.Lock()
+	id := r.nextEventSubscriberID
+	r.nextEventSubscriberID++
+	if r.eventSubscribers == nil {
+		r.eventSubscribers = map[int]func(RuntimeEvent){}
+	}
+	r.eventSubscribers[id] = listener
+	r.mu.Unlock()
+	return func() {
+		r.mu.Lock()
+		delete(r.eventSubscribers, id)
+		r.mu.Unlock()
+	}
+}
+
+func (r *Runtime) emitRuntimeEvent(event RuntimeEvent) {
+	r.mu.Lock()
+	listeners := make([]func(RuntimeEvent), 0, len(r.eventSubscribers))
+	for _, listener := range r.eventSubscribers {
+		listeners = append(listeners, listener)
+	}
+	r.mu.Unlock()
+
+	for _, listener := range listeners {
+		func(fn func(RuntimeEvent)) {
+			defer func() {
+				_ = recover()
+			}()
+			fn(event)
+		}(listener)
+	}
 }
 
 func (r *Runtime) appendSessionMessageWithEvents(ctx context.Context, message types.Message) error {
@@ -754,7 +1193,8 @@ func (r *Runtime) appendSessionMessageWithEvents(ctx context.Context, message ty
 			"toolCallID": message.ToolCallID,
 		},
 	})
-	if _, err := r.session.AppendMessage(message); err != nil {
+	entry, err := r.session.AppendMessage(message)
+	if err != nil {
 		return err
 	}
 	if message.Role == types.RoleAssistant {
@@ -782,6 +1222,10 @@ func (r *Runtime) appendSessionMessageWithEvents(ctx context.Context, message ty
 			"toolName":   message.ToolName,
 			"toolCallId": message.ToolCallID,
 			"toolCallID": message.ToolCallID,
+			"entry":      entry,
+			"entryId":    entry.ID,
+			"parentId":   entry.ParentID,
+			"leafId":     r.session.LeafID(),
 		},
 	})
 	return nil
@@ -805,7 +1249,20 @@ func (r *Runtime) tryExecuteSidecarCommand(text string) (bool, types.Message, er
 	if commandName == "" {
 		return false, types.Message{}, nil
 	}
-	result, err := r.sidecar.ExecuteCommand(context.Background(), commandName, commandArgs)
+	result, err := r.sidecar.ExecuteCommandWithRequest(context.Background(), extensionsidecar.ExecuteCommandRequest{
+		Name:               commandName,
+		Args:               commandArgs,
+		CurrentModel:       &r.model,
+		AllModels:          r.modelRegistry.GetAll(),
+		AvailableModels:    r.modelRegistry.GetAvailable(),
+		ProviderAPIKeys:    r.sidecarProviderAPIKeys(),
+		ProviderAuthTypes:  r.sidecarProviderAuthTypes(),
+		ContextUsage:       r.contextUsageSnapshot(),
+		SystemPrompt:       r.systemPrompt,
+		ThinkingLevel:      r.thinkingLevel,
+		IsIdle:             r.runtimeIsIdle(),
+		HasPendingMessages: r.hasQueuedMessages(),
+	})
 	if err != nil {
 		return false, types.Message{}, err
 	}
@@ -870,6 +1327,11 @@ func (r *Runtime) dequeueSteeringMessages() []types.Message {
 	if len(r.steeringQueue) == 0 {
 		return nil
 	}
+	if r.steeringMode == queueModeAll {
+		messages := append([]types.Message(nil), r.steeringQueue...)
+		r.steeringQueue = nil
+		return messages
+	}
 	next := r.steeringQueue[0]
 	r.steeringQueue = r.steeringQueue[1:]
 	return []types.Message{next}
@@ -880,6 +1342,11 @@ func (r *Runtime) dequeueFollowUpMessages() []types.Message {
 	defer r.mu.Unlock()
 	if len(r.followUpQueue) == 0 {
 		return nil
+	}
+	if r.followUpMode == queueModeAll {
+		messages := append([]types.Message(nil), r.followUpQueue...)
+		r.followUpQueue = nil
+		return messages
 	}
 	next := r.followUpQueue[0]
 	r.followUpQueue = r.followUpQueue[1:]
@@ -945,6 +1412,676 @@ func (r *Runtime) currentActiveToolNames() []string {
 	return names
 }
 
+func (r *Runtime) sidecarProviderAPIKeys() map[string]string {
+	providers := map[string]struct{}{}
+	for _, model := range r.modelRegistry.GetAll() {
+		provider := strings.TrimSpace(model.Provider)
+		if provider == "" {
+			continue
+		}
+		providers[provider] = struct{}{}
+	}
+	if provider := strings.TrimSpace(r.model.Provider); provider != "" {
+		providers[provider] = struct{}{}
+	}
+	if len(providers) == 0 {
+		return nil
+	}
+	keys := map[string]string{}
+	for provider := range providers {
+		key := strings.TrimSpace(r.auth.GetAPIKey(provider))
+		if key == "" {
+			continue
+		}
+		keys[provider] = key
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	return keys
+}
+
+func (r *Runtime) sidecarProviderAuthTypes() map[string]string {
+	providers := map[string]struct{}{}
+	for _, model := range r.modelRegistry.GetAll() {
+		provider := strings.TrimSpace(model.Provider)
+		if provider == "" {
+			continue
+		}
+		providers[provider] = struct{}{}
+	}
+	if provider := strings.TrimSpace(r.model.Provider); provider != "" {
+		providers[provider] = struct{}{}
+	}
+	if len(providers) == 0 {
+		return nil
+	}
+	authTypes := map[string]string{}
+	for provider := range providers {
+		authType := strings.TrimSpace(r.auth.ProviderAuthType(provider))
+		if authType == "" {
+			continue
+		}
+		authTypes[provider] = authType
+	}
+	if len(authTypes) == 0 {
+		return nil
+	}
+	return authTypes
+}
+
+func (r *Runtime) contextUsageSnapshot() map[string]any {
+	contextWindow := r.model.ContextWindow
+	if contextWindow <= 0 {
+		return nil
+	}
+
+	branch := r.session.Branch(r.session.LeafID())
+	if len(branch) == 0 {
+		return map[string]any{
+			"tokens":        int64(0),
+			"contextWindow": contextWindow,
+			"percent":       float64(0),
+		}
+	}
+
+	latestCompactionIndex := -1
+	for i := len(branch) - 1; i >= 0; i-- {
+		if branch[i].Type == "compaction" {
+			latestCompactionIndex = i
+			break
+		}
+	}
+	if latestCompactionIndex >= 0 {
+		hasPostCompactionUsage := false
+		for i := len(branch) - 1; i > latestCompactionIndex; i-- {
+			e := branch[i]
+			if e.Type != "message" || e.Message == nil {
+				continue
+			}
+			msg := e.Message
+			if msg.Role != types.RoleAssistant {
+				continue
+			}
+			if msg.StopReason == "aborted" || msg.StopReason == "error" {
+				continue
+			}
+			if calculateContextTokens(msg.Usage) > 0 {
+				hasPostCompactionUsage = true
+			}
+			break
+		}
+		if !hasPostCompactionUsage {
+			return map[string]any{
+				"tokens":        nil,
+				"contextWindow": contextWindow,
+				"percent":       nil,
+			}
+		}
+	}
+
+	ctxState := r.session.BuildContext(r.systemPrompt, r.session.LeafID(), r.currentToolsDefinitions())
+	tokens := estimateContextTokens(ctxState.Messages)
+	if tokens < 0 {
+		tokens = 0
+	}
+	percent := (float64(tokens) / float64(contextWindow)) * 100.0
+	return map[string]any{
+		"tokens":        tokens,
+		"contextWindow": contextWindow,
+		"percent":       percent,
+	}
+}
+
+func (r *Runtime) maybeAutoCompactThreshold(ctx context.Context) (bool, error) {
+	usage := r.contextUsageSnapshot()
+	if len(usage) == 0 {
+		return false, nil
+	}
+	percent, ok := float64Value(usage["percent"])
+	if !ok {
+		return false, nil
+	}
+	if percent < autoCompactionThresholdPercent {
+		return false, nil
+	}
+	return r.runAutoCompaction(ctx, "threshold", false, nil)
+}
+
+func (r *Runtime) runAutoCompaction(
+	ctx context.Context,
+	reason string,
+	willRetry bool,
+	causeErr error,
+) (bool, error) {
+	r.emitRuntimeEvent(RuntimeEvent{
+		Type: "auto_compaction_start",
+		Payload: map[string]any{
+			"reason": reason,
+		},
+	})
+
+	entry, err := r.compactContext(ctx, "", "")
+	if err != nil {
+		message := strings.TrimSpace(err.Error())
+		if causeErr != nil {
+			prefix := "Auto-compaction failed: "
+			if strings.EqualFold(reason, "overflow") {
+				prefix = "Context overflow recovery failed: "
+			}
+			message = prefix + strings.TrimSpace(causeErr.Error())
+		}
+		aborted := errors.Is(err, context.Canceled) || strings.Contains(strings.ToLower(err.Error()), "cancel")
+		r.emitRuntimeEvent(RuntimeEvent{
+			Type: "auto_compaction_end",
+			Payload: map[string]any{
+				"result":       nil,
+				"aborted":      aborted,
+				"willRetry":    false,
+				"errorMessage": message,
+			},
+		})
+		return false, err
+	}
+
+	result := map[string]any{
+		"summary":          entry.Summary,
+		"firstKeptEntryId": entry.FirstKeptEntry,
+		"tokensBefore":     entry.TokensBefore,
+		"details":          entry.Details,
+	}
+	r.emitRuntimeEvent(RuntimeEvent{
+		Type: "auto_compaction_end",
+		Payload: map[string]any{
+			"result":    result,
+			"aborted":   false,
+			"willRetry": willRetry,
+		},
+	})
+	return true, nil
+}
+
+func (r *Runtime) waitForRetryDelay(ctx context.Context, delay time.Duration) bool {
+	retryCtx, cancel := context.WithCancel(ctx)
+	r.mu.Lock()
+	r.abortRetry = cancel
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.abortRetry = nil
+		r.mu.Unlock()
+		cancel()
+	}()
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return false
+	case <-retryCtx.Done():
+		return true
+	}
+}
+
+func (r *Runtime) emitAutoRetryStart(attempt int, maxAttempts int, delay time.Duration, message string) {
+	r.emitRuntimeEvent(RuntimeEvent{
+		Type: "auto_retry_start",
+		Payload: map[string]any{
+			"attempt":      attempt,
+			"maxAttempts":  maxAttempts,
+			"delayMs":      int(delay / time.Millisecond),
+			"errorMessage": strings.TrimSpace(message),
+		},
+	})
+}
+
+func (r *Runtime) emitAutoRetryEnd(attempt int, success bool, finalError string) {
+	payload := map[string]any{
+		"success": success,
+		"attempt": attempt,
+	}
+	if trimmed := strings.TrimSpace(finalError); trimmed != "" {
+		payload["finalError"] = trimmed
+	}
+	r.emitRuntimeEvent(RuntimeEvent{
+		Type:    "auto_retry_end",
+		Payload: payload,
+	})
+}
+
+func isRetryableProviderError(err error) bool {
+	if err == nil || isContextOverflowProviderError(err) {
+		return false
+	}
+	return retryableProviderErrorPattern.MatchString(strings.ToLower(err.Error()))
+}
+
+func isContextOverflowProviderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return contextOverflowErrorPattern.MatchString(strings.ToLower(err.Error()))
+}
+
+func float64Value(raw any) (float64, bool) {
+	switch value := raw.(type) {
+	case float64:
+		return value, true
+	case float32:
+		return float64(value), true
+	case int:
+		return float64(value), true
+	case int32:
+		return float64(value), true
+	case int64:
+		return float64(value), true
+	default:
+		return 0, false
+	}
+}
+
+func estimateContextTokens(messages []types.Message) int64 {
+	if len(messages) == 0 {
+		return 0
+	}
+	lastUsageIndex := -1
+	var usageTokens int64
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role != types.RoleAssistant {
+			continue
+		}
+		if msg.StopReason == "aborted" || msg.StopReason == "error" {
+			continue
+		}
+		tokens := calculateContextTokens(msg.Usage)
+		if tokens <= 0 {
+			continue
+		}
+		lastUsageIndex = i
+		usageTokens = tokens
+		break
+	}
+	if lastUsageIndex < 0 {
+		var estimated int64
+		for _, message := range messages {
+			estimated += estimateMessageTokens(message)
+		}
+		return estimated
+	}
+	var trailing int64
+	for i := lastUsageIndex + 1; i < len(messages); i++ {
+		trailing += estimateMessageTokens(messages[i])
+	}
+	return usageTokens + trailing
+}
+
+func calculateContextTokens(usage types.Usage) int64 {
+	if usage.Total > 0 {
+		return usage.Total
+	}
+	return usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
+}
+
+func estimateMessageTokens(message types.Message) int64 {
+	chars := 0
+	for _, block := range message.Content {
+		switch block.Type {
+		case "text":
+			chars += len(block.Text)
+		case "thinking":
+			chars += len(block.Thinking)
+		case "toolCall":
+			chars += len(block.Name)
+			if len(block.Arguments) > 0 {
+				if b, err := json.Marshal(block.Arguments); err == nil {
+					chars += len(b)
+				}
+			}
+		default:
+			chars += len(block.Text)
+		}
+	}
+	if chars == 0 {
+		return 0
+	}
+	// Conservative estimate: ~4 chars/token.
+	return int64((chars + 3) / 4)
+}
+
+func (r *Runtime) compactContext(ctx context.Context, customInstructions string, requestID string) (session.Entry, error) {
+	branch := r.session.Branch(r.session.LeafID())
+	if len(branch) == 0 {
+		return session.Entry{}, errors.New("nothing to compact: session is empty")
+	}
+
+	firstKeptID, ok := selectCompactionFirstKeptEntry(branch, 8)
+	if !ok {
+		return session.Entry{}, errors.New("nothing to compact (session too small)")
+	}
+
+	tokensBefore := int(estimateContextTokens(
+		r.session.BuildContext(r.systemPrompt, r.session.LeafID(), r.currentToolsDefinitions()).Messages,
+	))
+
+	beforeResult := r.emitSessionBeforeCompact(ctx, firstKeptID, tokensBefore, customInstructions)
+	if beforeResult != nil && beforeResult.Cancel {
+		return session.Entry{}, errors.New("compaction cancelled")
+	}
+
+	summary := ""
+	fromExtension := false
+	var compactionDetails map[string]any
+	if beforeResult != nil && beforeResult.Compaction != nil && strings.TrimSpace(beforeResult.Compaction.Summary) != "" {
+		summary = strings.TrimSpace(beforeResult.Compaction.Summary)
+		if candidate := strings.TrimSpace(beforeResult.Compaction.FirstKeptEntryID); candidate != "" && branchHasEntryID(branch, candidate) {
+			firstKeptID = candidate
+		}
+		if beforeResult.Compaction.TokensBefore > 0 {
+			tokensBefore = beforeResult.Compaction.TokensBefore
+		}
+		compactionDetails = beforeResult.Compaction.Details
+		fromExtension = true
+	} else {
+		generated, err := r.generateCompactionSummary(ctx, branch, firstKeptID, customInstructions)
+		if err != nil {
+			return session.Entry{}, err
+		}
+		summary = generated
+	}
+	entry, err := r.session.AppendCompactionWithDetails(summary, firstKeptID, tokensBefore, compactionDetails)
+	if err != nil {
+		return session.Entry{}, err
+	}
+	_, _ = r.emitEventBestEffort(ctx, extensionsidecar.Event{
+		Type: "session_compact",
+		Payload: map[string]any{
+			"compactionEntry": entry,
+			"fromExtension":   fromExtension,
+			"requestId":       requestID,
+		},
+	})
+	return entry, nil
+}
+
+func selectCompactionFirstKeptEntry(branch []session.Entry, keepRecentMessages int) (string, bool) {
+	if keepRecentMessages <= 0 {
+		keepRecentMessages = 1
+	}
+	messageLikeIDs := make([]string, 0, len(branch))
+	for _, e := range branch {
+		if e.Type == "message" || e.Type == "custom_message" || e.Type == "branch_summary" {
+			messageLikeIDs = append(messageLikeIDs, e.ID)
+		}
+	}
+	if len(messageLikeIDs) <= keepRecentMessages {
+		return "", false
+	}
+	return messageLikeIDs[len(messageLikeIDs)-keepRecentMessages], true
+}
+
+func branchHasEntryID(branch []session.Entry, id string) bool {
+	for _, e := range branch {
+		if e.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Runtime) generateCompactionSummary(
+	ctx context.Context,
+	branch []session.Entry,
+	firstKeptID string,
+	customInstructions string,
+) (string, error) {
+	sourceText := formatCompactionSource(branch, firstKeptID)
+	if strings.TrimSpace(sourceText) == "" {
+		return "", errors.New("nothing to compact: no summarizable messages before cut point")
+	}
+
+	provider, err := r.currentProvider()
+	if err != nil {
+		return "", err
+	}
+	apiKey := r.auth.GetAPIKey(r.model.Provider)
+	if apiKey == "" && r.model.Provider != "amazon-bedrock" && r.model.Provider != "google-vertex" {
+		return "", fmt.Errorf("missing api key for provider %s", r.model.Provider)
+	}
+
+	prompt := "Summarize the earlier conversation context for a coding-agent session. " +
+		"Keep critical decisions, constraints, open tasks, and file/tool details concise and actionable."
+	if customInstructions != "" {
+		prompt += "\n\nAdditional instructions:\n" + customInstructions
+	}
+	prompt += "\n\nConversation to summarize:\n" + sourceText
+
+	resp, err := provider.Complete(types.CompletionRequest{
+		Model: r.model,
+		Context: types.Context{
+			SystemPrompt: "You summarize coding-agent conversation history.",
+			Messages: []types.Message{
+				types.TextMessage(types.RoleUser, prompt),
+			},
+		},
+		Options: types.CompletionOptions{
+			APIKey:    apiKey,
+			Context:   ctx,
+			SessionID: r.session.SessionID(),
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	summary := strings.TrimSpace(AssistantText(resp.Assistant))
+	if summary == "" {
+		summary = "Compaction summary unavailable."
+	}
+	return summary, nil
+}
+
+func formatCompactionSource(branch []session.Entry, firstKeptID string) string {
+	var lines []string
+	for _, entry := range branch {
+		if entry.ID == firstKeptID {
+			break
+		}
+		switch entry.Type {
+		case "message":
+			if entry.Message == nil {
+				continue
+			}
+			text := strings.TrimSpace(AssistantText(*entry.Message))
+			if text == "" {
+				continue
+			}
+			lines = append(lines, fmt.Sprintf("%s: %s", entry.Message.Role, text))
+		case "custom_message":
+			text := strings.TrimSpace(contentBlocksText(entry.Content))
+			if text == "" {
+				continue
+			}
+			if entry.CustomType != "" {
+				lines = append(lines, fmt.Sprintf("custom[%s]: %s", entry.CustomType, text))
+			} else {
+				lines = append(lines, "custom: "+text)
+			}
+		case "branch_summary":
+			text := strings.TrimSpace(entry.Summary)
+			if text == "" {
+				continue
+			}
+			lines = append(lines, "branch_summary: "+text)
+		case "model_change":
+			lines = append(lines, fmt.Sprintf("model_change: %s/%s", entry.Provider, entry.ModelID))
+		case "thinking_level_change":
+			lines = append(lines, "thinking_level_change: "+entry.ThinkingLevel)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func contentBlocksText(content []types.ContentBlock) string {
+	parts := make([]string, 0, len(content))
+	for _, block := range content {
+		if block.Type != "text" {
+			continue
+		}
+		text := strings.TrimSpace(block.Text)
+		if text == "" {
+			continue
+		}
+		parts = append(parts, text)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func (r *Runtime) applySessionSetupEntries(setupEntries []map[string]any) error {
+	refToEntryID := map[string]string{}
+	for _, raw := range setupEntries {
+		op := strings.ToLower(strings.TrimSpace(anyString(raw["op"])))
+		ref := strings.TrimSpace(anyString(raw["ref"]))
+		switch op {
+		case "append_message":
+			var msg types.Message
+			if b, err := json.Marshal(raw["message"]); err == nil {
+				_ = json.Unmarshal(b, &msg)
+			}
+			if msg.Role == "" {
+				msg.Role = types.RoleUser
+			}
+			if msg.Timestamp == 0 {
+				msg.Timestamp = types.NowMillis()
+			}
+			entry, err := r.session.AppendMessage(msg)
+			if err != nil {
+				return err
+			}
+			if ref != "" {
+				refToEntryID[ref] = entry.ID
+			}
+		case "append_thinking_level_change":
+			level := strings.TrimSpace(anyString(raw["thinkingLevel"]))
+			if level == "" {
+				continue
+			}
+			entry, err := r.session.AppendThinkingLevel(level)
+			if err != nil {
+				return err
+			}
+			if ref != "" {
+				refToEntryID[ref] = entry.ID
+			}
+		case "append_model_change":
+			provider := strings.TrimSpace(anyString(raw["provider"]))
+			modelID := strings.TrimSpace(anyString(raw["modelId"]))
+			if provider == "" || modelID == "" {
+				continue
+			}
+			entry, err := r.session.AppendModelChange(provider, modelID)
+			if err != nil {
+				return err
+			}
+			if ref != "" {
+				refToEntryID[ref] = entry.ID
+			}
+		case "append_custom_entry":
+			customType := strings.TrimSpace(anyString(raw["customType"]))
+			if customType == "" {
+				continue
+			}
+			data := anyMap(raw["data"])
+			entry, err := r.session.AppendCustomEntry(customType, data)
+			if err != nil {
+				return err
+			}
+			if ref != "" {
+				refToEntryID[ref] = entry.ID
+			}
+		case "append_custom_message":
+			customType := strings.TrimSpace(anyString(raw["customType"]))
+			if customType == "" {
+				continue
+			}
+			var content []types.ContentBlock
+			if b, err := json.Marshal(raw["content"]); err == nil {
+				_ = json.Unmarshal(b, &content)
+			}
+			if len(content) == 0 {
+				continue
+			}
+			display := true
+			if v, ok := raw["display"].(bool); ok {
+				display = v
+			}
+			details := anyMap(raw["details"])
+			entry, err := r.session.AppendCustomMessage(customType, content, display, details)
+			if err != nil {
+				return err
+			}
+			if ref != "" {
+				refToEntryID[ref] = entry.ID
+			}
+		case "append_session_info":
+			name := strings.TrimSpace(anyString(raw["name"]))
+			if name == "" {
+				continue
+			}
+			entry, err := r.session.AppendSessionName(name)
+			if err != nil {
+				return err
+			}
+			if ref != "" {
+				refToEntryID[ref] = entry.ID
+			}
+		case "append_label":
+			targetID := strings.TrimSpace(anyString(raw["targetId"]))
+			if targetRef := strings.TrimSpace(anyString(raw["targetRef"])); targetRef != "" {
+				if resolved, ok := refToEntryID[targetRef]; ok {
+					targetID = resolved
+				}
+			}
+			if targetID == "" {
+				continue
+			}
+			label := anyString(raw["label"])
+			entry, err := r.session.AppendLabel(targetID, label)
+			if err != nil {
+				return err
+			}
+			if ref != "" {
+				refToEntryID[ref] = entry.ID
+			}
+		default:
+			continue
+		}
+	}
+	return nil
+}
+
+func anyString(value any) string {
+	if value == nil {
+		return ""
+	}
+	if s, ok := value.(string); ok {
+		return s
+	}
+	return fmt.Sprint(value)
+}
+
+func anyMap(value any) map[string]any {
+	v, ok := value.(map[string]any)
+	if !ok || len(v) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(v))
+	for k, item := range v {
+		out[k] = item
+	}
+	return out
+}
+
 func (r *Runtime) currentToolsDefinitions() []types.Tool {
 	defs := r.tools.Definitions()
 	r.mu.Lock()
@@ -975,11 +2112,22 @@ func (r *Runtime) applySidecarActions(ctx context.Context, actions []extensionsi
 	for _, action := range actions {
 		switch strings.ToLower(strings.TrimSpace(action.Type)) {
 		case "send_user_message":
-			text := strings.TrimSpace(action.Text)
-			if text == "" {
-				continue
+			content := make([]types.ContentBlock, 0, len(action.Content))
+			for _, block := range action.Content {
+				content = append(content, block)
 			}
-			msg := types.TextMessage(types.RoleUser, text)
+			text := strings.TrimSpace(action.Text)
+			if len(content) == 0 {
+				if text == "" {
+					continue
+				}
+				content = []types.ContentBlock{{Type: "text", Text: text}}
+			}
+			msg := types.Message{
+				Role:      types.RoleUser,
+				Timestamp: types.NowMillis(),
+				Content:   content,
+			}
 			delivery := normalizeActionDelivery(action.DeliverAs)
 			if delivery == "" {
 				delivery = "steer"
@@ -1070,8 +2218,7 @@ func (r *Runtime) applySidecarActions(ctx context.Context, actions []extensionsi
 			if level == "" {
 				continue
 			}
-			r.thinkingLevel = level
-			if _, err := r.session.AppendThinkingLevel(level); err != nil {
+			if err := r.SetThinkingLevel(level); err != nil {
 				return triggerRun, emittedMessage, err
 			}
 		case "append_entry":
@@ -1103,7 +2250,12 @@ func (r *Runtime) applySidecarActions(ctx context.Context, actions []extensionsi
 				return triggerRun, emittedMessage, err
 			}
 		case "new_session":
-			cancelled, err := r.startNewSession(ctx, strings.TrimSpace(action.ParentSession))
+			cancelled, err := r.startNewSession(
+				ctx,
+				strings.TrimSpace(action.ParentSession),
+				action.SkipBeforeHooks,
+				action.SetupEntries,
+			)
 			if err != nil {
 				return triggerRun, emittedMessage, err
 			}
@@ -1115,7 +2267,7 @@ func (r *Runtime) applySidecarActions(ctx context.Context, actions []extensionsi
 			if path == "" {
 				continue
 			}
-			cancelled, err := r.switchSession(ctx, path)
+			cancelled, err := r.switchSession(ctx, path, action.SkipBeforeHooks)
 			if err != nil {
 				return triggerRun, emittedMessage, err
 			}
@@ -1127,7 +2279,7 @@ func (r *Runtime) applySidecarActions(ctx context.Context, actions []extensionsi
 			if entryID == "" {
 				continue
 			}
-			cancelled, err := r.forkSession(ctx, entryID)
+			cancelled, err := r.forkSession(ctx, entryID, action.SkipBeforeHooks)
 			if err != nil {
 				return triggerRun, emittedMessage, err
 			}
@@ -1145,6 +2297,16 @@ func (r *Runtime) applySidecarActions(ctx context.Context, actions []extensionsi
 			if err := r.navigateTree(ctx, targetID, action); err != nil {
 				return triggerRun, emittedMessage, err
 			}
+		case "compact":
+			if _, err := r.compactContext(ctx, strings.TrimSpace(action.CustomInstructions), strings.TrimSpace(action.RequestID)); err != nil {
+				_, _ = r.emitEventBestEffort(ctx, extensionsidecar.Event{
+					Type: "session_compact_error",
+					Payload: map[string]any{
+						"requestId": action.RequestID,
+						"error":     err.Error(),
+					},
+				})
+			}
 		case "reload", "wait_for_idle":
 			// No-op in CLI text mode; accepted for extension compatibility.
 			continue
@@ -1158,22 +2320,182 @@ func (r *Runtime) applySidecarActions(ctx context.Context, actions []extensionsi
 	return triggerRun, emittedMessage, nil
 }
 
-func (r *Runtime) startNewSession(ctx context.Context, parentSession string) (bool, error) {
+type ForkMessage struct {
+	EntryID string `json:"entryId"`
+	Text    string `json:"text"`
+}
+
+type SessionTokenStats struct {
+	Input      int64 `json:"input"`
+	Output     int64 `json:"output"`
+	CacheRead  int64 `json:"cacheRead"`
+	CacheWrite int64 `json:"cacheWrite"`
+	Total      int64 `json:"total"`
+}
+
+type SessionStats struct {
+	SessionFile       string            `json:"sessionFile,omitempty"`
+	SessionID         string            `json:"sessionId"`
+	UserMessages      int               `json:"userMessages"`
+	AssistantMessages int               `json:"assistantMessages"`
+	ToolCalls         int               `json:"toolCalls"`
+	ToolResults       int               `json:"toolResults"`
+	TotalMessages     int               `json:"totalMessages"`
+	Tokens            SessionTokenStats `json:"tokens"`
+	Cost              float64           `json:"cost"`
+}
+
+func (r *Runtime) Compact(customInstructions string, requestID string) (session.Entry, error) {
+	return r.compactContext(context.Background(), strings.TrimSpace(customInstructions), strings.TrimSpace(requestID))
+}
+
+func (r *Runtime) NewSession(parentSession string, setupEntries []map[string]any) (bool, error) {
+	return r.startNewSession(context.Background(), strings.TrimSpace(parentSession), false, setupEntries)
+}
+
+func (r *Runtime) SwitchSession(path string) (bool, error) {
+	return r.switchSession(context.Background(), strings.TrimSpace(path), false)
+}
+
+func (r *Runtime) ForkSession(entryID string) (string, bool, error) {
+	entryID = strings.TrimSpace(entryID)
+	selected := r.userMessageTextByEntryID(entryID)
+	cancelled, err := r.forkSession(context.Background(), entryID, false)
+	return selected, cancelled, err
+}
+
+func (r *Runtime) SetSessionName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("session name is empty")
+	}
+	_, err := r.session.AppendSessionName(name)
+	return err
+}
+
+func (r *Runtime) Messages() []types.Message {
+	ctx := r.session.BuildContext(r.systemPrompt, r.session.LeafID(), r.currentToolsDefinitions())
+	out := make([]types.Message, len(ctx.Messages))
+	copy(out, ctx.Messages)
+	return out
+}
+
+func (r *Runtime) LastAssistantText() (string, bool) {
+	messages := r.Messages()
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != types.RoleAssistant {
+			continue
+		}
+		return strings.TrimSpace(AssistantText(messages[i])), true
+	}
+	return "", false
+}
+
+func (r *Runtime) ForkMessages() []ForkMessage {
+	branch := r.session.Branch(r.session.LeafID())
+	out := make([]ForkMessage, 0, len(branch))
+	for _, entry := range branch {
+		if entry.Type != "message" || entry.Message == nil || entry.Message.Role != types.RoleUser {
+			continue
+		}
+		text := strings.TrimSpace(AssistantText(*entry.Message))
+		if text == "" {
+			continue
+		}
+		out = append(out, ForkMessage{
+			EntryID: entry.ID,
+			Text:    text,
+		})
+	}
+	return out
+}
+
+func (r *Runtime) SessionStats() SessionStats {
+	stats := SessionStats{
+		SessionFile: r.session.SessionFile(),
+		SessionID:   r.session.SessionID(),
+	}
+	branch := r.session.Branch(r.session.LeafID())
+	for _, entry := range branch {
+		if entry.Type != "message" || entry.Message == nil {
+			continue
+		}
+		message := entry.Message
+		stats.TotalMessages++
+		switch message.Role {
+		case types.RoleUser:
+			stats.UserMessages++
+		case types.RoleAssistant:
+			stats.AssistantMessages++
+		case types.RoleTool:
+			stats.ToolResults++
+		}
+		for _, block := range message.Content {
+			if block.Type == "toolCall" {
+				stats.ToolCalls++
+			}
+		}
+		if message.Role != types.RoleAssistant {
+			continue
+		}
+		stats.Tokens.Input += message.Usage.Input
+		stats.Tokens.Output += message.Usage.Output
+		stats.Tokens.CacheRead += message.Usage.CacheRead
+		stats.Tokens.CacheWrite += message.Usage.CacheWrite
+		if message.Usage.Total > 0 {
+			stats.Tokens.Total += message.Usage.Total
+		} else {
+			stats.Tokens.Total += message.Usage.Input + message.Usage.Output + message.Usage.CacheRead + message.Usage.CacheWrite
+		}
+		stats.Cost += message.Usage.CostTotal
+	}
+	return stats
+}
+
+func (r *Runtime) userMessageTextByEntryID(entryID string) string {
+	if entryID == "" {
+		return ""
+	}
+	for _, entry := range r.session.Entries() {
+		if entry.ID != entryID || entry.Type != "message" || entry.Message == nil {
+			continue
+		}
+		if entry.Message.Role != types.RoleUser {
+			return ""
+		}
+		return strings.TrimSpace(AssistantText(*entry.Message))
+	}
+	return ""
+}
+
+func (r *Runtime) startNewSession(
+	ctx context.Context,
+	parentSession string,
+	skipBeforeHooks bool,
+	setupEntries []map[string]any,
+) (bool, error) {
 	previousSessionFile := r.session.SessionFile()
-	if r.emitSessionBeforeSwitch(ctx, "new", "") {
+	if !skipBeforeHooks && r.emitSessionBeforeSwitch(ctx, "new", "") {
 		return true, nil
 	}
-	if strings.TrimSpace(parentSession) == "" {
-		parentSession = r.session.SessionID()
-	}
+	parentSession = strings.TrimSpace(parentSession)
 	if err := r.session.CreateNew(r.session.CWD(), parentSession); err != nil {
 		return false, err
 	}
-	if _, err := r.session.AppendModelChange(r.model.Provider, r.model.ID); err != nil {
+	currentModel := r.Model()
+	if _, err := r.session.AppendModelChange(currentModel.Provider, currentModel.ID); err != nil {
 		return false, err
 	}
-	if _, err := r.session.AppendThinkingLevel(r.thinkingLevel); err != nil {
+	if _, err := r.session.AppendThinkingLevel(r.ThinkingLevel()); err != nil {
 		return false, err
+	}
+	if len(setupEntries) > 0 {
+		if err := r.applySessionSetupEntries(setupEntries); err != nil {
+			return false, err
+		}
+		if err := r.syncRuntimeFromSessionState(); err != nil {
+			return false, err
+		}
 	}
 	r.emitSessionSwitch(ctx, "new", previousSessionFile)
 	if err := r.emitSessionStartEvent(r.sidecar); err != nil {
@@ -1182,9 +2504,9 @@ func (r *Runtime) startNewSession(ctx context.Context, parentSession string) (bo
 	return false, nil
 }
 
-func (r *Runtime) switchSession(ctx context.Context, path string) (bool, error) {
+func (r *Runtime) switchSession(ctx context.Context, path string, skipBeforeHooks bool) (bool, error) {
 	previousSessionFile := r.session.SessionFile()
-	if r.emitSessionBeforeSwitch(ctx, "resume", path) {
+	if !skipBeforeHooks && r.emitSessionBeforeSwitch(ctx, "resume", path) {
 		return true, nil
 	}
 	if err := r.session.Open(path); err != nil {
@@ -1200,19 +2522,19 @@ func (r *Runtime) switchSession(ctx context.Context, path string) (bool, error) 
 	return false, nil
 }
 
-func (r *Runtime) forkSession(ctx context.Context, entryID string) (bool, error) {
-	if r.emitSessionBeforeFork(ctx, entryID) {
+func (r *Runtime) forkSession(ctx context.Context, entryID string, skipBeforeHooks bool) (bool, error) {
+	if !skipBeforeHooks && r.emitSessionBeforeFork(ctx, entryID) {
 		return true, nil
 	}
 	branch := r.session.Branch(entryID)
 	if len(branch) == 0 {
 		return false, fmt.Errorf("cannot fork: entry %s not found", entryID)
 	}
-	parentSession := r.session.SessionID()
 	previousSessionFile := r.session.SessionFile()
+	parentSession := strings.TrimSpace(previousSessionFile)
 	cwd := r.session.CWD()
-	prevModel := r.model
-	prevThinking := r.thinkingLevel
+	prevModel := r.Model()
+	prevThinking := r.ThinkingLevel()
 
 	if err := r.session.CreateNew(cwd, parentSession); err != nil {
 		return false, err
@@ -1238,11 +2560,11 @@ func (r *Runtime) forkSession(ctx context.Context, entryID string) (bool, error)
 			}
 			sawThinkingLevel = true
 		case "compaction":
-			if _, err := r.session.AppendCompaction(e.Summary, e.FirstKeptEntry, e.TokensBefore); err != nil {
+			if _, err := r.session.AppendCompactionWithDetails(e.Summary, e.FirstKeptEntry, e.TokensBefore, e.Details); err != nil {
 				return false, err
 			}
 		case "branch_summary":
-			if _, err := r.session.AppendBranchSummary(e.FromID, e.Summary); err != nil {
+			if _, err := r.session.AppendBranchSummaryWithDetails(e.FromID, e.Summary, e.Details); err != nil {
 				return false, err
 			}
 		case "custom":
@@ -1289,11 +2611,42 @@ func (r *Runtime) navigateTree(ctx context.Context, targetID string, action exte
 	if oldLeafID == targetID {
 		return nil
 	}
-	if r.emitSessionBeforeTree(ctx, targetID, oldLeafID, action) {
-		return nil
+	customInstructions := strings.TrimSpace(action.CustomInstructions)
+	replaceInstructions := action.ReplaceInstructions
+	label := strings.TrimSpace(action.Label)
+	summaryText := strings.TrimSpace(action.Summary)
+	summaryDetails := action.SummaryDetails
+	if !action.SkipBeforeHooks {
+		beforeResult := r.emitSessionBeforeTree(ctx, targetID, oldLeafID, action)
+		if beforeResult != nil {
+			if beforeResult.Cancel {
+				return nil
+			}
+			if strings.TrimSpace(beforeResult.CustomInstructions) != "" {
+				customInstructions = strings.TrimSpace(beforeResult.CustomInstructions)
+			}
+			if beforeResult.ReplaceInstructions != nil {
+				replaceInstructions = *beforeResult.ReplaceInstructions
+			}
+			if strings.TrimSpace(beforeResult.Label) != "" {
+				label = strings.TrimSpace(beforeResult.Label)
+			}
+			if beforeResult.Summary != nil && strings.TrimSpace(beforeResult.Summary.Summary) != "" {
+				summaryText = strings.TrimSpace(beforeResult.Summary.Summary)
+				summaryDetails = beforeResult.Summary.Details
+			}
+		}
 	}
 	if err := r.session.SetLeaf(targetID); err != nil {
 		return err
+	}
+	var summaryEntryID string
+	if summaryText != "" {
+		entry, err := r.session.AppendBranchSummaryWithDetails(oldLeafID, summaryText, summaryDetails)
+		if err != nil {
+			return err
+		}
+		summaryEntryID = entry.ID
 	}
 	payload := map[string]any{
 		"targetId":      targetID,
@@ -1304,14 +2657,21 @@ func (r *Runtime) navigateTree(ctx context.Context, targetID string, action exte
 	if action.Summarize {
 		payload["userWantsSummary"] = true
 	}
-	if strings.TrimSpace(action.CustomInstructions) != "" {
-		payload["customInstructions"] = action.CustomInstructions
+	if customInstructions != "" {
+		payload["customInstructions"] = customInstructions
 	}
-	if action.ReplaceInstructions {
+	if replaceInstructions {
 		payload["replaceInstructions"] = true
 	}
-	if strings.TrimSpace(action.Label) != "" {
-		payload["label"] = action.Label
+	if label != "" {
+		payload["label"] = label
+	}
+	if summaryEntryID != "" {
+		payload["summaryEntry"] = map[string]any{
+			"id":      summaryEntryID,
+			"summary": summaryText,
+			"details": summaryDetails,
+		}
 	}
 	_, _ = r.emitEventBestEffort(ctx, extensionsidecar.Event{
 		Type:    "session_tree",
@@ -1363,12 +2723,36 @@ func (r *Runtime) emitSessionFork(ctx context.Context, previousSessionFile strin
 	})
 }
 
+func (r *Runtime) emitSessionBeforeCompact(
+	ctx context.Context,
+	firstKeptEntryID string,
+	tokensBefore int,
+	customInstructions string,
+) *extensionsidecar.SessionBeforeCompactEventResult {
+	preparation := map[string]any{
+		"firstKeptEntryId": firstKeptEntryID,
+		"tokensBefore":     tokensBefore,
+	}
+	result, ok := r.emitEventBestEffort(ctx, extensionsidecar.Event{
+		Type: "session_before_compact",
+		Payload: map[string]any{
+			"preparation":        preparation,
+			"customInstructions": customInstructions,
+			"branchEntries":      sessionEntriesMaps(r.session.Branch(r.session.LeafID())),
+		},
+	})
+	if !ok {
+		return nil
+	}
+	return result.SessionBeforeCompact
+}
+
 func (r *Runtime) emitSessionBeforeTree(
 	ctx context.Context,
 	targetID string,
 	oldLeafID string,
 	action extensionsidecar.HostAction,
-) bool {
+) *extensionsidecar.SessionBeforeTreeEventResult {
 	preparation := map[string]any{
 		"targetId":         targetID,
 		"oldLeafId":        oldLeafID,
@@ -1389,13 +2773,18 @@ func (r *Runtime) emitSessionBeforeTree(
 			"preparation": preparation,
 		},
 	})
-	return ok && result.SessionBeforeTree != nil && result.SessionBeforeTree.Cancel
+	if !ok {
+		return nil
+	}
+	return result.SessionBeforeTree
 }
 
 func (r *Runtime) syncRuntimeFromSessionState() error {
 	ctx := r.session.BuildContext(r.systemPrompt, r.session.LeafID(), r.currentToolsDefinitions())
 	if strings.TrimSpace(ctx.ThinkingLevel) != "" {
+		r.mu.Lock()
 		r.thinkingLevel = strings.TrimSpace(ctx.ThinkingLevel)
+		r.mu.Unlock()
 	}
 	provider := strings.TrimSpace(ctx.ModelProvider)
 	modelID := strings.TrimSpace(ctx.ModelID)
@@ -1406,8 +2795,61 @@ func (r *Runtime) syncRuntimeFromSessionState() error {
 	if err != nil {
 		return err
 	}
+	r.mu.Lock()
 	r.model = model
+	r.mu.Unlock()
 	return nil
+}
+
+func sessionHeaderMap(h session.Header) map[string]any {
+	out := map[string]any{
+		"type":      h.Type,
+		"id":        h.ID,
+		"timestamp": h.Timestamp,
+		"cwd":       h.CWD,
+	}
+	if h.Version != 0 {
+		out["version"] = h.Version
+	}
+	if strings.TrimSpace(h.ParentSession) != "" {
+		out["parentSession"] = h.ParentSession
+	}
+	return out
+}
+
+func sessionEntriesMaps(entries []session.Entry) []map[string]any {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		b, err := json.Marshal(entry)
+		if err != nil {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func extensionUIRequestPayload(req extensionsidecar.ExtensionUIRequest) map[string]any {
+	payload := map[string]any{
+		"id":     req.ID,
+		"method": req.Method,
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		return payload
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(b, &decoded); err != nil || len(decoded) == 0 {
+		return payload
+	}
+	return decoded
 }
 
 func normalizeActionDelivery(value string) string {
@@ -1423,5 +2865,43 @@ func normalizeActionDelivery(value string) string {
 	}
 }
 
+func normalizeQueueMode(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case queueModeAll:
+		return queueModeAll, nil
+	case queueModeOneAtATime, "one_at_a_time", "oneatatime":
+		return queueModeOneAtATime, nil
+	default:
+		return "", fmt.Errorf("invalid queue mode: %s", value)
+	}
+}
+
+func hasMessageContent(content []types.ContentBlock) bool {
+	if len(content) == 0 {
+		return false
+	}
+	for _, block := range content {
+		switch block.Type {
+		case "text":
+			if strings.TrimSpace(block.Text) != "" {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	return false
+}
+
 const extensionEventTimeout = 2 * time.Second
+const extensionUIResponseTimeout = 5 * time.Second
+const autoCompactionThresholdPercent = 85.0
+const autoRetryMaxAttempts = 3
+const autoRetryBaseDelay = 500 * time.Millisecond
 const skippedToolCallReason = "Skipped due to queued user message."
+const queueModeAll = "all"
+const queueModeOneAtATime = "one-at-a-time"
+
+var thinkingLevelCycle = []string{"low", "medium", "high"}
+var retryableProviderErrorPattern = regexp.MustCompile(`overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server error|internal error|connection.?error|connection.?refused|fetch failed|terminated|retry`)
+var contextOverflowErrorPattern = regexp.MustCompile(`context.?window|context.?length|maximum context|prompt is too long|too many tokens|context overflow|token limit`)

@@ -33,6 +33,7 @@ func main() {
 		ExtensionSidecarArgs:    opts.ExtensionSidecarArgs,
 		ExtensionPaths:          opts.ExtensionPaths,
 		ExtensionFlagValues:     opts.ExtensionFlagValues,
+		EnableExtensionUI:       strings.EqualFold(strings.TrimSpace(opts.Mode), "rpc"),
 	})
 	if err != nil {
 		die(err)
@@ -48,6 +49,13 @@ func main() {
 		<-sigCh
 		rt.Abort()
 	}()
+
+	if strings.EqualFold(strings.TrimSpace(opts.Mode), "rpc") {
+		if err := runRPCMode(os.Stdin, os.Stdout, rt); err != nil {
+			die(err)
+		}
+		return
+	}
 
 	msg := strings.TrimSpace(strings.Join(opts.MessageParts, " "))
 	if msg == "" && !opts.ContinueOnly {
@@ -103,6 +111,7 @@ func die(err error) {
 }
 
 type cliOptions struct {
+	Mode                    string
 	Provider                string
 	Model                   string
 	APIKey                  string
@@ -122,6 +131,7 @@ type cliOptions struct {
 
 func parseCLIArgs(args []string) (cliOptions, error) {
 	opts := cliOptions{
+		Mode:                "text",
 		CWD:                 ".",
 		ExtensionFlagValues: map[string]any{},
 	}
@@ -139,6 +149,19 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 
 		name, inlineValue, hasInline := splitLongFlag(arg)
 		switch name {
+		case "mode":
+			v, consumed, err := parseRequiredValue(args, i, inlineValue, hasInline)
+			if err != nil {
+				return opts, err
+			}
+			v = strings.ToLower(strings.TrimSpace(v))
+			switch v {
+			case "text", "rpc":
+				opts.Mode = v
+			default:
+				return opts, fmt.Errorf("unsupported mode %q (expected text or rpc)", v)
+			}
+			i += consumed
 		case "provider":
 			v, consumed, err := parseRequiredValue(args, i, inlineValue, hasInline)
 			if err != nil {

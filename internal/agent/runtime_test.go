@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -616,6 +617,59 @@ func TestRuntimeRegistersSidecarProviderAndModel(t *testing.T) {
 	}
 }
 
+func TestRuntimeCloseEmitsSessionShutdownEvent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"ok","tool_calls":[]},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer server.CloseClientConnections()
+	defer server.Close()
+
+	agentDir := t.TempDir()
+	writeTestConfig(t, agentDir, server.URL)
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+
+	markerPath := filepath.Join(t.TempDir(), "session-shutdown.marker")
+	rt, err := NewRuntime(NewRuntimeOptions{
+		CWD:                     t.TempDir(),
+		SessionDir:              t.TempDir(),
+		NoSession:               true,
+		Provider:                "openai",
+		Model:                   "gpt-test",
+		ExtensionSidecarCommand: os.Args[0],
+		ExtensionSidecarArgs:    []string{"-test.run=TestRuntimeSidecarHelperProcess"},
+		ExtensionSidecarEnv: []string{
+			"GO_WANT_RUNTIME_SIDECAR_HELPER=1",
+			"GO_RUNTIME_SIDECAR_SHUTDOWN_MARKER=" + markerPath,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime with sidecar: %v", err)
+	}
+
+	if err := rt.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, err := os.Stat(markerPath)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat shutdown marker: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected sidecar to receive session_shutdown and write marker %q", markerPath)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestRuntimeWithNodeExtensionFixtureEndToEnd(t *testing.T) {
 	nodePath, err := exec.LookPath("node")
 	if err != nil {
@@ -897,6 +951,89 @@ func TestRuntimeExtensionCommandSendUserMessageTriggersTurn(t *testing.T) {
 	body, _ := firstBody.Load().(string)
 	if !strings.Contains(body, "summarize extension action bridge") {
 		t.Fatalf("expected extension command message in provider payload, got: %s", body)
+	}
+}
+
+func TestRuntimeExtensionCommandSendUserMessageSupportsImageContent(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve caller")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
+	sidecarPath := filepath.Join(repoRoot, "sidecar", "node-extension-runtime", "main.mjs")
+	extensionPath := filepath.Join(filepath.Dir(thisFile), "testdata", "send_user_message_extension.mjs")
+
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&callCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"extension-image-done","tool_calls":[]},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer server.CloseClientConnections()
+	defer server.Close()
+
+	agentDir := t.TempDir()
+	writeTestConfig(t, agentDir, server.URL)
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+
+	rt, err := NewRuntime(NewRuntimeOptions{
+		CWD:                     t.TempDir(),
+		SessionDir:              t.TempDir(),
+		NoSession:               true,
+		Provider:                "openai",
+		Model:                   "gpt-test",
+		ExtensionSidecarCommand: nodePath,
+		ExtensionSidecarArgs:    []string{sidecarPath},
+		ExtensionPaths:          []string{extensionPath},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime with node sidecar: %v", err)
+	}
+	defer func() {
+		_ = rt.Close()
+	}()
+
+	assistant, err := rt.Prompt("/askwithimage summarize screenshot")
+	if err != nil {
+		t.Fatalf("Prompt /askwithimage: %v", err)
+	}
+	if AssistantText(assistant) != "extension-image-done" {
+		t.Fatalf("assistant text = %q, want extension-image-done", AssistantText(assistant))
+	}
+	if got := atomic.LoadInt32(&callCount); got != 1 {
+		t.Fatalf("expected provider to be called once, got %d", got)
+	}
+
+	var sawUserImage bool
+	for _, e := range rt.Session().Entries() {
+		if e.Type != "message" || e.Message == nil || e.Message.Role != types.RoleUser {
+			continue
+		}
+		var sawText bool
+		var sawImage bool
+		for _, block := range e.Message.Content {
+			if block.Type == "text" && strings.Contains(block.Text, "summarize screenshot") {
+				sawText = true
+			}
+			if block.Type == "image" && block.Data == "aGVsbG8=" && block.MimeType == "image/png" {
+				sawImage = true
+			}
+		}
+		if sawText && sawImage {
+			sawUserImage = true
+			break
+		}
+	}
+	if !sawUserImage {
+		t.Fatalf("expected user message with text+image content from pi.sendUserMessage(...)")
 	}
 }
 
@@ -1342,15 +1479,23 @@ func TestRuntimeExtensionSessionParityHooksAndStateSync(t *testing.T) {
 	if _, err := rt.Prompt("/armcancelswitch"); err != nil {
 		t.Fatalf("Prompt /armcancelswitch: %v", err)
 	}
-	if _, err := rt.Prompt("/newsession"); err != nil {
+	cancelledNew, err := rt.Prompt("/newsession")
+	if err != nil {
 		t.Fatalf("Prompt /newsession (cancelled): %v", err)
+	}
+	if AssistantText(cancelledNew) != "new-session-cancelled" {
+		t.Fatalf("assistant text = %q, want new-session-cancelled", AssistantText(cancelledNew))
 	}
 	if rt.Session().SessionFile() != oldSessionPath {
 		t.Fatalf("expected cancelled /newsession to keep session path %q, got %q", oldSessionPath, rt.Session().SessionFile())
 	}
 
-	if _, err := rt.Prompt("/newsession"); err != nil {
+	newSessionAssistant, err := rt.Prompt("/newsession")
+	if err != nil {
 		t.Fatalf("Prompt /newsession: %v", err)
+	}
+	if AssistantText(newSessionAssistant) != "new-session-ok" {
+		t.Fatalf("assistant text = %q, want new-session-ok", AssistantText(newSessionAssistant))
 	}
 	newSessionPath := rt.Session().SessionFile()
 	if newSessionPath == oldSessionPath {
@@ -1367,9 +1512,45 @@ func TestRuntimeExtensionSessionParityHooksAndStateSync(t *testing.T) {
 	if afterNewSessionPath != newSessionPath {
 		t.Fatalf("sessioninfo path after /newsession = %q, want %q", afterNewSessionPath, newSessionPath)
 	}
+	if got := strings.TrimSpace(rt.Session().Header().ParentSession); got != "" {
+		t.Fatalf("expected /newsession default parentSession to be empty, got %q", got)
+	}
 
-	if _, err := rt.Prompt("/switchsession " + oldSessionPath); err != nil {
+	newSessionParentAssistant, err := rt.Prompt("/newsessionparent " + oldSessionPath)
+	if err != nil {
+		t.Fatalf("Prompt /newsessionparent: %v", err)
+	}
+	if AssistantText(newSessionParentAssistant) != "new-session-parent-ok" {
+		t.Fatalf("assistant text = %q, want new-session-parent-ok", AssistantText(newSessionParentAssistant))
+	}
+	if got := strings.TrimSpace(rt.Session().Header().ParentSession); got != oldSessionPath {
+		t.Fatalf("expected /newsessionparent parentSession %q, got %q", oldSessionPath, got)
+	}
+	parentSessionPath := rt.Session().SessionFile()
+	if parentSessionPath == "" {
+		t.Fatalf("expected non-empty session path after /newsessionparent")
+	}
+
+	if _, err := rt.Prompt("/armcancelswitch"); err != nil {
+		t.Fatalf("Prompt /armcancelswitch (for switch): %v", err)
+	}
+	cancelledSwitch, err := rt.Prompt("/switchsession " + oldSessionPath)
+	if err != nil {
+		t.Fatalf("Prompt /switchsession (cancelled): %v", err)
+	}
+	if AssistantText(cancelledSwitch) != "switch-session-cancelled" {
+		t.Fatalf("assistant text = %q, want switch-session-cancelled", AssistantText(cancelledSwitch))
+	}
+	if rt.Session().SessionFile() != parentSessionPath {
+		t.Fatalf("expected cancelled /switchsession to keep session path %q, got %q", parentSessionPath, rt.Session().SessionFile())
+	}
+
+	switchAssistant, err := rt.Prompt("/switchsession " + oldSessionPath)
+	if err != nil {
 		t.Fatalf("Prompt /switchsession: %v", err)
+	}
+	if AssistantText(switchAssistant) != "switch-session-ok" {
+		t.Fatalf("assistant text = %q, want switch-session-ok", AssistantText(switchAssistant))
 	}
 	if rt.Session().SessionFile() != oldSessionPath {
 		t.Fatalf("expected switched session path %q, got %q", oldSessionPath, rt.Session().SessionFile())
@@ -1386,19 +1567,30 @@ func TestRuntimeExtensionSessionParityHooksAndStateSync(t *testing.T) {
 	if _, err := rt.Prompt("/armcancelfork"); err != nil {
 		t.Fatalf("Prompt /armcancelfork: %v", err)
 	}
-	if _, err := rt.Prompt("/forkat " + seedUserEntryID); err != nil {
+	cancelledFork, err := rt.Prompt("/forkat " + seedUserEntryID)
+	if err != nil {
 		t.Fatalf("Prompt /forkat (cancelled): %v", err)
+	}
+	if AssistantText(cancelledFork) != "fork-cancelled" {
+		t.Fatalf("assistant text = %q, want fork-cancelled", AssistantText(cancelledFork))
 	}
 	if rt.Session().SessionFile() != oldSessionPath {
 		t.Fatalf("expected cancelled /forkat to keep session path %q, got %q", oldSessionPath, rt.Session().SessionFile())
 	}
 
-	if _, err := rt.Prompt("/forkat " + seedUserEntryID); err != nil {
+	forkAssistant, err := rt.Prompt("/forkat " + seedUserEntryID)
+	if err != nil {
 		t.Fatalf("Prompt /forkat: %v", err)
+	}
+	if AssistantText(forkAssistant) != "fork-ok" {
+		t.Fatalf("assistant text = %q, want fork-ok", AssistantText(forkAssistant))
 	}
 	forkedSessionPath := rt.Session().SessionFile()
 	if forkedSessionPath == oldSessionPath {
 		t.Fatalf("expected /forkat to switch to new forked session, got unchanged %q", forkedSessionPath)
+	}
+	if got := strings.TrimSpace(rt.Session().Header().ParentSession); got != oldSessionPath {
+		t.Fatalf("expected forked session parentSession %q, got %q", oldSessionPath, got)
 	}
 	navigateTargetID := ""
 	for _, e := range rt.Session().Entries() {
@@ -1418,18 +1610,57 @@ func TestRuntimeExtensionSessionParityHooksAndStateSync(t *testing.T) {
 		t.Fatalf("Prompt /armcanceltree: %v", err)
 	}
 	leafBeforeCancelledNavigate := rt.Session().LeafID()
-	if _, err := rt.Prompt("/navigateopts " + navigateTargetID); err != nil {
+	cancelledNavigate, err := rt.Prompt("/navigateopts " + navigateTargetID)
+	if err != nil {
 		t.Fatalf("Prompt /navigateopts (cancelled): %v", err)
 	}
-	if got := findLatestAssistantParent("navigate-opts-ok"); got != leafBeforeCancelledNavigate {
+	if AssistantText(cancelledNavigate) != "navigate-opts-cancelled" {
+		t.Fatalf("assistant text = %q, want navigate-opts-cancelled", AssistantText(cancelledNavigate))
+	}
+	if got := findLatestAssistantParent("navigate-opts-cancelled"); got != leafBeforeCancelledNavigate {
 		t.Fatalf("expected cancelled /navigateopts output parent %q, got %q", leafBeforeCancelledNavigate, got)
 	}
 
-	if _, err := rt.Prompt("/navigateopts " + navigateTargetID); err != nil {
+	navigateAssistant, err := rt.Prompt("/navigateopts " + navigateTargetID)
+	if err != nil {
 		t.Fatalf("Prompt /navigateopts: %v", err)
+	}
+	if AssistantText(navigateAssistant) != "navigate-opts-ok" {
+		t.Fatalf("assistant text = %q, want navigate-opts-ok", AssistantText(navigateAssistant))
 	}
 	if got := findLatestAssistantParent("navigate-opts-ok"); got != navigateTargetID {
 		t.Fatalf("expected /navigateopts output parent %q, got %q", navigateTargetID, got)
+	}
+
+	if _, err := rt.Prompt("/armtreesummary"); err != nil {
+		t.Fatalf("Prompt /armtreesummary: %v", err)
+	}
+	summaryNavigateAssistant, err := rt.Prompt("/navigateopts " + leafBeforeCancelledNavigate)
+	if err != nil {
+		t.Fatalf("Prompt /navigateopts (summary): %v", err)
+	}
+	if AssistantText(summaryNavigateAssistant) != "navigate-opts-ok" {
+		t.Fatalf("assistant text = %q, want navigate-opts-ok", AssistantText(summaryNavigateAssistant))
+	}
+	var sawInjectedBranchSummary bool
+	var sawInjectedBranchSummaryDetails bool
+	for _, e := range rt.Session().Entries() {
+		if e.Type != "branch_summary" {
+			continue
+		}
+		if strings.Contains(e.Summary, "parity-tree-summary") {
+			sawInjectedBranchSummary = true
+			if e.Details != nil && e.Details["source"] == "session_parity_extension" {
+				sawInjectedBranchSummaryDetails = true
+			}
+			break
+		}
+	}
+	if !sawInjectedBranchSummary {
+		t.Fatalf("expected injected branch_summary entry from session_before_tree summary override")
+	}
+	if !sawInjectedBranchSummaryDetails {
+		t.Fatalf("expected injected branch_summary details to be persisted")
 	}
 
 	dumpAssistant, err := rt.Prompt("/eventsdump")
@@ -1690,6 +1921,896 @@ func TestRuntimeExtensionExecAndMessageRendererShim(t *testing.T) {
 	}
 }
 
+func TestRuntimeExtensionReadonlySessionManagerSurface(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve caller")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
+	sidecarPath := filepath.Join(repoRoot, "sidecar", "node-extension-runtime", "main.mjs")
+	extensionPath := filepath.Join(filepath.Dir(thisFile), "testdata", "session_manager_extension.mjs")
+
+	var providerCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"seed-ok","tool_calls":[]},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer server.CloseClientConnections()
+	defer server.Close()
+
+	agentDir := t.TempDir()
+	writeTestConfig(t, agentDir, server.URL)
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+
+	rt, err := NewRuntime(NewRuntimeOptions{
+		CWD:                     t.TempDir(),
+		SessionDir:              t.TempDir(),
+		Provider:                "openai",
+		Model:                   "gpt-test",
+		ExtensionSidecarCommand: nodePath,
+		ExtensionSidecarArgs:    []string{sidecarPath},
+		ExtensionPaths:          []string{extensionPath},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime with node sidecar: %v", err)
+	}
+	defer func() {
+		_ = rt.Close()
+	}()
+
+	if _, err := rt.Prompt("seed readonly session manager"); err != nil {
+		t.Fatalf("Prompt seed readonly session manager: %v", err)
+	}
+
+	diagAssistant, err := rt.Prompt("/smdiag")
+	if err != nil {
+		t.Fatalf("Prompt /smdiag: %v", err)
+	}
+	var diag struct {
+		HasShape     bool   `json:"hasShape"`
+		CWD          string `json:"cwd"`
+		SessionDir   string `json:"sessionDir"`
+		SessionID    string `json:"sessionId"`
+		SessionFile  string `json:"sessionFile"`
+		SessionName  string `json:"sessionName"`
+		LeafID       string `json:"leafId"`
+		LeafEntryID  string `json:"leafEntryId"`
+		HeaderID     string `json:"headerId"`
+		EntryByLeaf  string `json:"entryByLeafId"`
+		EntriesCount int    `json:"entriesCount"`
+		BranchCount  int    `json:"branchCount"`
+		TreeRoots    int    `json:"treeRoots"`
+	}
+	if err := json.Unmarshal([]byte(AssistantText(diagAssistant)), &diag); err != nil {
+		t.Fatalf("decode /smdiag JSON: %v", err)
+	}
+	if !diag.HasShape {
+		t.Fatalf("expected readonly session manager shape to be available")
+	}
+	if diag.SessionID != rt.Session().SessionID() {
+		t.Fatalf("sessionId = %q, want %q", diag.SessionID, rt.Session().SessionID())
+	}
+	if diag.SessionFile != rt.Session().SessionFile() {
+		t.Fatalf("sessionFile = %q, want %q", diag.SessionFile, rt.Session().SessionFile())
+	}
+	if diag.SessionDir != rt.Session().SessionDir() {
+		t.Fatalf("sessionDir = %q, want %q", diag.SessionDir, rt.Session().SessionDir())
+	}
+	if diag.HeaderID != rt.Session().SessionID() {
+		t.Fatalf("headerId = %q, want %q", diag.HeaderID, rt.Session().SessionID())
+	}
+	if diag.LeafID == "" {
+		t.Fatalf("expected non-empty leafId")
+	}
+	if diag.LeafEntryID != diag.LeafID {
+		t.Fatalf("leafEntryId = %q, want leafId %q", diag.LeafEntryID, diag.LeafID)
+	}
+	if diag.EntryByLeaf != diag.LeafID {
+		t.Fatalf("entryByLeafId = %q, want leafId %q", diag.EntryByLeaf, diag.LeafID)
+	}
+	if diag.EntriesCount == 0 {
+		t.Fatalf("expected entriesCount > 0")
+	}
+	if diag.BranchCount == 0 {
+		t.Fatalf("expected branchCount > 0")
+	}
+	if diag.TreeRoots == 0 {
+		t.Fatalf("expected treeRoots > 0")
+	}
+
+	nameAssistant, err := rt.Prompt("/smname")
+	if err != nil {
+		t.Fatalf("Prompt /smname: %v", err)
+	}
+	if AssistantText(nameAssistant) != "smname-ok" {
+		t.Fatalf("assistant text = %q, want smname-ok", AssistantText(nameAssistant))
+	}
+	diagAfterName, err := rt.Prompt("/smdiag")
+	if err != nil {
+		t.Fatalf("Prompt /smdiag after /smname: %v", err)
+	}
+	if err := json.Unmarshal([]byte(AssistantText(diagAfterName)), &diag); err != nil {
+		t.Fatalf("decode /smdiag after /smname JSON: %v", err)
+	}
+	if diag.SessionName != "smdiag-session" {
+		t.Fatalf("sessionName = %q, want smdiag-session", diag.SessionName)
+	}
+
+	labelAssistant, err := rt.Prompt("/smlabel")
+	if err != nil {
+		t.Fatalf("Prompt /smlabel: %v", err)
+	}
+	labelText := AssistantText(labelAssistant)
+	if !strings.HasPrefix(labelText, "smlabel-ok:") {
+		t.Fatalf("assistant text = %q, want prefix smlabel-ok:", labelText)
+	}
+	targetID := strings.TrimSpace(strings.TrimPrefix(labelText, "smlabel-ok:"))
+	if targetID == "" {
+		t.Fatalf("expected non-empty target id from /smlabel")
+	}
+	labelCheckAssistant, err := rt.Prompt("/smgetlabel " + targetID)
+	if err != nil {
+		t.Fatalf("Prompt /smgetlabel: %v", err)
+	}
+	if AssistantText(labelCheckAssistant) != "smdiag-label" {
+		t.Fatalf("assistant text = %q, want smdiag-label", AssistantText(labelCheckAssistant))
+	}
+
+	if got := atomic.LoadInt32(&providerCalls); got != 1 {
+		t.Fatalf("expected provider to be called once for seed prompt, got %d", got)
+	}
+}
+
+func TestRuntimeExtensionContextParitySurface(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve caller")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
+	sidecarPath := filepath.Join(repoRoot, "sidecar", "node-extension-runtime", "main.mjs")
+	extensionPath := filepath.Join(filepath.Dir(thisFile), "testdata", "context_parity_extension.mjs")
+
+	var providerCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"seed-ok","tool_calls":[]},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer server.CloseClientConnections()
+	defer server.Close()
+
+	agentDir := t.TempDir()
+	writeTestConfig(t, agentDir, server.URL)
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+
+	rt, err := NewRuntime(NewRuntimeOptions{
+		CWD:                     t.TempDir(),
+		SessionDir:              t.TempDir(),
+		Provider:                "openai",
+		Model:                   "gpt-test",
+		SystemPrompt:            "ctxdiag-system",
+		ExtensionSidecarCommand: nodePath,
+		ExtensionSidecarArgs:    []string{sidecarPath},
+		ExtensionPaths:          []string{extensionPath},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime with node sidecar: %v", err)
+	}
+	defer func() {
+		_ = rt.Close()
+	}()
+
+	if _, err := rt.Prompt("seed context parity"); err != nil {
+		t.Fatalf("Prompt seed context parity: %v", err)
+	}
+
+	thinkingAssistant, err := rt.Prompt("/ctxsetthinking high")
+	if err != nil {
+		t.Fatalf("Prompt /ctxsetthinking: %v", err)
+	}
+	if AssistantText(thinkingAssistant) != "ctxsetthinking:high" {
+		t.Fatalf("assistant text = %q, want ctxsetthinking:high", AssistantText(thinkingAssistant))
+	}
+
+	diagAssistant, err := rt.Prompt("/ctxdiag")
+	if err != nil {
+		t.Fatalf("Prompt /ctxdiag: %v", err)
+	}
+	var diag struct {
+		HasContextShape          bool   `json:"hasContextShape"`
+		HasModelRegistryShape    bool   `json:"hasModelRegistryShape"`
+		ModelProvider            string `json:"modelProvider"`
+		ModelID                  string `json:"modelId"`
+		FoundCurrentModel        bool   `json:"foundCurrentModel"`
+		AvailableCount           int    `json:"availableCount"`
+		AvailableHasCurrent      bool   `json:"availableHasCurrent"`
+		SystemPrompt             string `json:"systemPrompt"`
+		IsIdle                   bool   `json:"isIdle"`
+		HasPendingMessages       bool   `json:"hasPendingMessages"`
+		ContextUsageVisible      bool   `json:"contextUsageVisible"`
+		ThinkingLevel            string `json:"thinkingLevel"`
+		APIKeyForModelPresent    bool   `json:"apiKeyForModelPresent"`
+		APIKeyForProviderPresent bool   `json:"apiKeyForProviderPresent"`
+		APIKeyByProviderPresent  bool   `json:"apiKeyByProviderPresent"`
+		UsingOAuth               bool   `json:"usingOAuth"`
+	}
+	if err := json.Unmarshal([]byte(AssistantText(diagAssistant)), &diag); err != nil {
+		t.Fatalf("decode /ctxdiag JSON: %v", err)
+	}
+	if !diag.HasContextShape {
+		t.Fatalf("expected extension context shape to be available")
+	}
+	if !diag.HasModelRegistryShape {
+		t.Fatalf("expected model registry shape to be available")
+	}
+	if diag.ModelProvider != rt.Model().Provider {
+		t.Fatalf("modelProvider = %q, want %q", diag.ModelProvider, rt.Model().Provider)
+	}
+	if diag.ModelID != rt.Model().ID {
+		t.Fatalf("modelId = %q, want %q", diag.ModelID, rt.Model().ID)
+	}
+	if !diag.FoundCurrentModel {
+		t.Fatalf("expected modelRegistry.find() to resolve current model")
+	}
+	if diag.AvailableCount == 0 {
+		t.Fatalf("expected available model count > 0")
+	}
+	if !diag.AvailableHasCurrent {
+		t.Fatalf("expected available model set to include current model")
+	}
+	if diag.SystemPrompt != "ctxdiag-system" {
+		t.Fatalf("systemPrompt = %q, want ctxdiag-system", diag.SystemPrompt)
+	}
+	if !diag.IsIdle {
+		t.Fatalf("expected ctx.isIdle() == true in command context")
+	}
+	if diag.HasPendingMessages {
+		t.Fatalf("expected ctx.hasPendingMessages() == false in command context")
+	}
+	if !diag.ContextUsageVisible {
+		t.Fatalf("expected ctx.getContextUsage() to be visible")
+	}
+	if diag.ThinkingLevel != "high" {
+		t.Fatalf("thinkingLevel = %q, want high", diag.ThinkingLevel)
+	}
+	if !diag.APIKeyForModelPresent {
+		t.Fatalf("expected modelRegistry.getApiKey(ctx.model) to return configured key")
+	}
+	if !diag.APIKeyForProviderPresent {
+		t.Fatalf("expected modelRegistry.getApiKeyForProvider() to return configured key")
+	}
+	if !diag.APIKeyByProviderPresent {
+		t.Fatalf("expected modelRegistry.getApiKeyByProvider() to return configured key")
+	}
+	if diag.UsingOAuth {
+		t.Fatalf("expected ctx.modelRegistry.isUsingOAuth(ctx.model) == false for api_key auth")
+	}
+
+	if got := atomic.LoadInt32(&providerCalls); got != 1 {
+		t.Fatalf("expected provider to be called once for seed prompt, got %d", got)
+	}
+}
+
+func TestRuntimeExtensionModelRegistryIsUsingOAuthParity(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve caller")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
+	sidecarPath := filepath.Join(repoRoot, "sidecar", "node-extension-runtime", "main.mjs")
+	extensionPath := filepath.Join(filepath.Dir(thisFile), "testdata", "context_parity_extension.mjs")
+
+	var providerCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"oauth-seed-ok","tool_calls":[]},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer server.CloseClientConnections()
+	defer server.Close()
+
+	agentDir := t.TempDir()
+	writeOAuthTestConfig(t, agentDir, server.URL)
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+
+	rt, err := NewRuntime(NewRuntimeOptions{
+		CWD:                     t.TempDir(),
+		SessionDir:              t.TempDir(),
+		Provider:                "openai",
+		Model:                   "gpt-test",
+		ExtensionSidecarCommand: nodePath,
+		ExtensionSidecarArgs:    []string{sidecarPath},
+		ExtensionPaths:          []string{extensionPath},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime with node sidecar: %v", err)
+	}
+	defer func() {
+		_ = rt.Close()
+	}()
+
+	if _, err := rt.Prompt("seed oauth context parity"); err != nil {
+		t.Fatalf("Prompt seed oauth context parity: %v", err)
+	}
+
+	diagAssistant, err := rt.Prompt("/ctxdiag")
+	if err != nil {
+		t.Fatalf("Prompt /ctxdiag oauth: %v", err)
+	}
+	var diag struct {
+		UsingOAuth bool `json:"usingOAuth"`
+	}
+	if err := json.Unmarshal([]byte(AssistantText(diagAssistant)), &diag); err != nil {
+		t.Fatalf("decode /ctxdiag oauth JSON: %v", err)
+	}
+	if !diag.UsingOAuth {
+		t.Fatalf("expected ctx.modelRegistry.isUsingOAuth(ctx.model) == true for oauth auth")
+	}
+
+	if got := atomic.LoadInt32(&providerCalls); got != 1 {
+		t.Fatalf("expected provider to be called once for seed prompt, got %d", got)
+	}
+}
+
+func TestRuntimeExtensionContextUsageAndCompactAction(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve caller")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
+	sidecarPath := filepath.Join(repoRoot, "sidecar", "node-extension-runtime", "main.mjs")
+	extensionPath := filepath.Join(filepath.Dir(thisFile), "testdata", "context_parity_extension.mjs")
+
+	var providerCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"summary-ok","tool_calls":[]},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":30,"completion_tokens":10,"total_tokens":40}
+		}`))
+	}))
+	defer server.CloseClientConnections()
+	defer server.Close()
+
+	agentDir := t.TempDir()
+	writeTestConfig(t, agentDir, server.URL)
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+
+	rt, err := NewRuntime(NewRuntimeOptions{
+		CWD:                     t.TempDir(),
+		SessionDir:              t.TempDir(),
+		Provider:                "openai",
+		Model:                   "gpt-test",
+		SystemPrompt:            "ctxcompact-system",
+		ExtensionSidecarCommand: nodePath,
+		ExtensionSidecarArgs:    []string{sidecarPath},
+		ExtensionPaths:          []string{extensionPath},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime with node sidecar: %v", err)
+	}
+	defer func() {
+		_ = rt.Close()
+	}()
+
+	for i := 0; i < 5; i++ {
+		if _, err := rt.Prompt(fmt.Sprintf("seed compaction parity %d", i)); err != nil {
+			t.Fatalf("Prompt seed compaction parity %d: %v", i, err)
+		}
+	}
+
+	usageBeforeAssistant, err := rt.Prompt("/ctxusage")
+	if err != nil {
+		t.Fatalf("Prompt /ctxusage before compact: %v", err)
+	}
+	var usageBefore struct {
+		HasUsage      bool     `json:"hasUsage"`
+		Tokens        *int64   `json:"tokens"`
+		ContextWindow int64    `json:"contextWindow"`
+		Percent       *float64 `json:"percent"`
+	}
+	if err := json.Unmarshal([]byte(AssistantText(usageBeforeAssistant)), &usageBefore); err != nil {
+		t.Fatalf("decode /ctxusage before JSON: %v", err)
+	}
+	if !usageBefore.HasUsage {
+		t.Fatalf("expected context usage snapshot before compact")
+	}
+	if usageBefore.ContextWindow <= 0 {
+		t.Fatalf("expected contextWindow > 0, got %d", usageBefore.ContextWindow)
+	}
+	if usageBefore.Tokens == nil {
+		t.Fatalf("expected tokens before compact to be known")
+	}
+
+	compactAssistant, err := rt.Prompt("/ctxcompact include key TODOs")
+	if err != nil {
+		t.Fatalf("Prompt /ctxcompact: %v", err)
+	}
+	if AssistantText(compactAssistant) != "ctxcompact-ok" {
+		t.Fatalf("assistant text = %q, want ctxcompact-ok", AssistantText(compactAssistant))
+	}
+
+	entries := rt.Session().Entries()
+	var foundCompaction bool
+	for _, entry := range entries {
+		if entry.Type != "compaction" {
+			continue
+		}
+		foundCompaction = true
+		if strings.TrimSpace(entry.Summary) == "" {
+			t.Fatalf("expected non-empty compaction summary")
+		}
+		if strings.TrimSpace(entry.FirstKeptEntry) == "" {
+			t.Fatalf("expected non-empty compaction firstKeptEntryId")
+		}
+		break
+	}
+	if !foundCompaction {
+		t.Fatalf("expected compaction entry after /ctxcompact")
+	}
+
+	usageAfterAssistant, err := rt.Prompt("/ctxusage")
+	if err != nil {
+		t.Fatalf("Prompt /ctxusage after compact: %v", err)
+	}
+	var usageAfter struct {
+		HasUsage      bool     `json:"hasUsage"`
+		Tokens        *int64   `json:"tokens"`
+		ContextWindow int64    `json:"contextWindow"`
+		Percent       *float64 `json:"percent"`
+	}
+	if err := json.Unmarshal([]byte(AssistantText(usageAfterAssistant)), &usageAfter); err != nil {
+		t.Fatalf("decode /ctxusage after JSON: %v", err)
+	}
+	if !usageAfter.HasUsage {
+		t.Fatalf("expected context usage snapshot after compact")
+	}
+	if usageAfter.ContextWindow <= 0 {
+		t.Fatalf("expected contextWindow > 0 after compact")
+	}
+	if usageAfter.Tokens != nil {
+		t.Fatalf("expected tokens to be unknown immediately after compaction")
+	}
+	if usageAfter.Percent != nil {
+		t.Fatalf("expected percent to be unknown immediately after compaction")
+	}
+
+	if got := atomic.LoadInt32(&providerCalls); got < 2 {
+		t.Fatalf("expected provider to be called for seed prompt and compaction summary, got %d", got)
+	}
+}
+
+func TestRuntimeExtensionCompactionHooksParity(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve caller")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
+	sidecarPath := filepath.Join(repoRoot, "sidecar", "node-extension-runtime", "main.mjs")
+	extensionPath := filepath.Join(filepath.Dir(thisFile), "testdata", "compaction_extension.mjs")
+
+	var providerCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"seed-ok","tool_calls":[]},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":20,"completion_tokens":10,"total_tokens":30}
+		}`))
+	}))
+	defer server.CloseClientConnections()
+	defer server.Close()
+
+	agentDir := t.TempDir()
+	writeTestConfig(t, agentDir, server.URL)
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+
+	rt, err := NewRuntime(NewRuntimeOptions{
+		CWD:                     t.TempDir(),
+		SessionDir:              t.TempDir(),
+		Provider:                "openai",
+		Model:                   "gpt-test",
+		SystemPrompt:            "compaction-hook-system",
+		ExtensionSidecarCommand: nodePath,
+		ExtensionSidecarArgs:    []string{sidecarPath},
+		ExtensionPaths:          []string{extensionPath},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime with node sidecar: %v", err)
+	}
+	defer func() {
+		_ = rt.Close()
+	}()
+
+	for i := 0; i < 5; i++ {
+		if _, err := rt.Prompt(fmt.Sprintf("seed compaction hook parity %d", i)); err != nil {
+			t.Fatalf("Prompt seed compaction hook parity %d: %v", i, err)
+		}
+	}
+
+	armCustom, err := rt.Prompt("/armcustomcompact")
+	if err != nil {
+		t.Fatalf("Prompt /armcustomcompact: %v", err)
+	}
+	if AssistantText(armCustom) != "custom-compact-armed" {
+		t.Fatalf("assistant text = %q, want custom-compact-armed", AssistantText(armCustom))
+	}
+
+	runCompact, err := rt.Prompt("/runcompact include unresolved TODOs")
+	if err != nil {
+		t.Fatalf("Prompt /runcompact custom: %v", err)
+	}
+	if AssistantText(runCompact) != "runcompact-ok" {
+		t.Fatalf("assistant text = %q, want runcompact-ok", AssistantText(runCompact))
+	}
+
+	entries := rt.Session().Entries()
+	compactionCount := 0
+	foundCustomSummary := false
+	foundCustomDetails := false
+	for _, entry := range entries {
+		if entry.Type != "compaction" {
+			continue
+		}
+		compactionCount++
+		if entry.Summary == "extension-compaction-summary" {
+			foundCustomSummary = true
+			if entry.Details != nil && entry.Details["source"] == "compaction_extension" {
+				foundCustomDetails = true
+			}
+		}
+	}
+	if !foundCustomSummary {
+		t.Fatalf("expected custom compaction summary from session_before_compact override")
+	}
+	if !foundCustomDetails {
+		t.Fatalf("expected custom compaction details to be persisted")
+	}
+	if compactionCount == 0 {
+		t.Fatalf("expected at least one compaction entry")
+	}
+
+	eventsAssistant, err := rt.Prompt("/compactevents")
+	if err != nil {
+		t.Fatalf("Prompt /compactevents: %v", err)
+	}
+	var events struct {
+		BeforeCompact []struct {
+			FirstKeptEntryID   string `json:"firstKeptEntryId"`
+			TokensBefore       int    `json:"tokensBefore"`
+			CustomInstructions string `json:"customInstructions"`
+		} `json:"beforeCompact"`
+		CompactEvents []struct {
+			FromExtension bool   `json:"fromExtension"`
+			Summary       string `json:"summary"`
+		} `json:"compactEvents"`
+	}
+	if err := json.Unmarshal([]byte(AssistantText(eventsAssistant)), &events); err != nil {
+		t.Fatalf("decode /compactevents JSON: %v", err)
+	}
+	if len(events.BeforeCompact) == 0 {
+		t.Fatalf("expected session_before_compact hook to run")
+	}
+	if len(events.CompactEvents) == 0 {
+		t.Fatalf("expected session_compact event to run")
+	}
+	lastCompact := events.CompactEvents[len(events.CompactEvents)-1]
+	if !lastCompact.FromExtension {
+		t.Fatalf("expected session_compact.fromExtension=true for custom override")
+	}
+	if lastCompact.Summary != "extension-compaction-summary" {
+		t.Fatalf("session_compact summary = %q, want extension-compaction-summary", lastCompact.Summary)
+	}
+
+	mirrorAssistant, err := rt.Prompt("/compactmirror")
+	if err != nil {
+		t.Fatalf("Prompt /compactmirror: %v", err)
+	}
+	var mirror struct {
+		Count         int    `json:"count"`
+		LatestSummary string `json:"latestSummary"`
+	}
+	if err := json.Unmarshal([]byte(AssistantText(mirrorAssistant)), &mirror); err != nil {
+		t.Fatalf("decode /compactmirror JSON: %v", err)
+	}
+	if mirror.Count != compactionCount {
+		t.Fatalf("session mirror compaction count = %d, want %d", mirror.Count, compactionCount)
+	}
+	if mirror.LatestSummary != "extension-compaction-summary" {
+		t.Fatalf("session mirror latestSummary = %q, want extension-compaction-summary", mirror.LatestSummary)
+	}
+
+	armCancel, err := rt.Prompt("/armcancelcompact")
+	if err != nil {
+		t.Fatalf("Prompt /armcancelcompact: %v", err)
+	}
+	if AssistantText(armCancel) != "cancel-compact-armed" {
+		t.Fatalf("assistant text = %q, want cancel-compact-armed", AssistantText(armCancel))
+	}
+
+	runCancelled, err := rt.Prompt("/runcompact should-cancel")
+	if err != nil {
+		t.Fatalf("Prompt /runcompact cancel path: %v", err)
+	}
+	if AssistantText(runCancelled) != "runcompact-ok" {
+		t.Fatalf("assistant text = %q, want runcompact-ok on cancel path", AssistantText(runCancelled))
+	}
+
+	newCompactionCount := 0
+	for _, entry := range rt.Session().Entries() {
+		if entry.Type == "compaction" {
+			newCompactionCount++
+		}
+	}
+	if newCompactionCount != compactionCount {
+		t.Fatalf("expected cancelled compaction to keep count at %d, got %d", compactionCount, newCompactionCount)
+	}
+
+	mirrorAfterCancelAssistant, err := rt.Prompt("/compactmirror")
+	if err != nil {
+		t.Fatalf("Prompt /compactmirror after cancel: %v", err)
+	}
+	var mirrorAfterCancel struct {
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal([]byte(AssistantText(mirrorAfterCancelAssistant)), &mirrorAfterCancel); err != nil {
+		t.Fatalf("decode /compactmirror after cancel JSON: %v", err)
+	}
+	if mirrorAfterCancel.Count != compactionCount {
+		t.Fatalf("expected mirrored compaction count to stay at %d after cancel, got %d", compactionCount, mirrorAfterCancel.Count)
+	}
+
+	if got := atomic.LoadInt32(&providerCalls); got != 5 {
+		t.Fatalf("expected provider calls to stay at seed prompts only (5), got %d", got)
+	}
+}
+
+func TestRuntimeExtensionNewSessionSetupCallbackParity(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve caller")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
+	sidecarPath := filepath.Join(repoRoot, "sidecar", "node-extension-runtime", "main.mjs")
+	extensionPath := filepath.Join(filepath.Dir(thisFile), "testdata", "new_session_setup_extension.mjs")
+
+	var providerCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"seed-ok","tool_calls":[]},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":5,"completion_tokens":5,"total_tokens":10}
+		}`))
+	}))
+	defer server.CloseClientConnections()
+	defer server.Close()
+
+	agentDir := t.TempDir()
+	writeTestConfig(t, agentDir, server.URL)
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+
+	rt, err := NewRuntime(NewRuntimeOptions{
+		CWD:                     t.TempDir(),
+		SessionDir:              t.TempDir(),
+		Provider:                "openai",
+		Model:                   "gpt-test",
+		ExtensionSidecarCommand: nodePath,
+		ExtensionSidecarArgs:    []string{sidecarPath},
+		ExtensionPaths:          []string{extensionPath},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime with node sidecar: %v", err)
+	}
+	defer func() {
+		_ = rt.Close()
+	}()
+
+	if _, err := rt.Prompt("seed setup callback parity"); err != nil {
+		t.Fatalf("Prompt seed setup callback parity: %v", err)
+	}
+	oldSessionFile := rt.Session().SessionFile()
+
+	setupAssistant, err := rt.Prompt("/newwithsetup")
+	if err != nil {
+		t.Fatalf("Prompt /newwithsetup: %v", err)
+	}
+	if AssistantText(setupAssistant) != "newwithsetup-ok" {
+		t.Fatalf("assistant text = %q, want newwithsetup-ok", AssistantText(setupAssistant))
+	}
+	if rt.Session().SessionFile() == oldSessionFile {
+		t.Fatalf("expected new session file after /newwithsetup")
+	}
+
+	diagAssistant, err := rt.Prompt("/setupdiag")
+	if err != nil {
+		t.Fatalf("Prompt /setupdiag: %v", err)
+	}
+	var diag struct {
+		SessionName      string `json:"sessionName"`
+		SetupMessageSeen bool   `json:"setupMessageSeen"`
+		SetupCustomSeen  bool   `json:"setupCustomSeen"`
+		SetupLabel       string `json:"setupLabel"`
+	}
+	if err := json.Unmarshal([]byte(AssistantText(diagAssistant)), &diag); err != nil {
+		t.Fatalf("decode /setupdiag JSON: %v", err)
+	}
+	if diag.SessionName != "setup-session-name" {
+		t.Fatalf("sessionName = %q, want setup-session-name", diag.SessionName)
+	}
+	if !diag.SetupMessageSeen {
+		t.Fatalf("expected setup message from setup callback")
+	}
+	if !diag.SetupCustomSeen {
+		t.Fatalf("expected setup custom message from setup callback")
+	}
+	if diag.SetupLabel != "setup-label" {
+		t.Fatalf("setupLabel = %q, want setup-label", diag.SetupLabel)
+	}
+
+	if got := atomic.LoadInt32(&providerCalls); got != 1 {
+		t.Fatalf("expected provider calls to remain at seed prompt only (1), got %d", got)
+	}
+}
+
+func TestRuntimeExtensionCompactCallbacksParity(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve caller")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
+	sidecarPath := filepath.Join(repoRoot, "sidecar", "node-extension-runtime", "main.mjs")
+	extensionPath := filepath.Join(filepath.Dir(thisFile), "testdata", "compact_callbacks_extension.mjs")
+
+	var providerCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"summary-ok","tool_calls":[]},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":20,"completion_tokens":10,"total_tokens":30}
+		}`))
+	}))
+	defer server.CloseClientConnections()
+	defer server.Close()
+
+	agentDir := t.TempDir()
+	writeTestConfig(t, agentDir, server.URL)
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+
+	rt, err := NewRuntime(NewRuntimeOptions{
+		CWD:                     t.TempDir(),
+		SessionDir:              t.TempDir(),
+		Provider:                "openai",
+		Model:                   "gpt-test",
+		SystemPrompt:            "compact-callback-system",
+		ExtensionSidecarCommand: nodePath,
+		ExtensionSidecarArgs:    []string{sidecarPath},
+		ExtensionPaths:          []string{extensionPath},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime with node sidecar: %v", err)
+	}
+	defer func() {
+		_ = rt.Close()
+	}()
+
+	failArm, err := rt.Prompt("/compactcbfail")
+	if err != nil {
+		t.Fatalf("Prompt /compactcbfail: %v", err)
+	}
+	if AssistantText(failArm) != "compactcbfail-armed" {
+		t.Fatalf("assistant text = %q, want compactcbfail-armed", AssistantText(failArm))
+	}
+
+	failStateAssistant, err := rt.Prompt("/compactcbstate")
+	if err != nil {
+		t.Fatalf("Prompt /compactcbstate after fail: %v", err)
+	}
+	var failState struct {
+		Completed bool   `json:"completed"`
+		Summary   string `json:"summary"`
+		Error     string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(AssistantText(failStateAssistant)), &failState); err != nil {
+		t.Fatalf("decode fail compactcbstate JSON: %v", err)
+	}
+	if failState.Completed {
+		t.Fatalf("expected completed=false for fail path")
+	}
+	if strings.TrimSpace(failState.Error) == "" {
+		t.Fatalf("expected non-empty error message for fail path")
+	}
+	if got := atomic.LoadInt32(&providerCalls); got != 0 {
+		t.Fatalf("expected no provider calls for fail path, got %d", got)
+	}
+
+	for i := 0; i < 5; i++ {
+		if _, err := rt.Prompt(fmt.Sprintf("seed compact callbacks %d", i)); err != nil {
+			t.Fatalf("Prompt seed compact callbacks %d: %v", i, err)
+		}
+	}
+
+	okArm, err := rt.Prompt("/compactcbok keep critical TODOs")
+	if err != nil {
+		t.Fatalf("Prompt /compactcbok: %v", err)
+	}
+	if AssistantText(okArm) != "compactcbok-armed" {
+		t.Fatalf("assistant text = %q, want compactcbok-armed", AssistantText(okArm))
+	}
+
+	okStateAssistant, err := rt.Prompt("/compactcbstate")
+	if err != nil {
+		t.Fatalf("Prompt /compactcbstate after success: %v", err)
+	}
+	var okState struct {
+		Completed bool   `json:"completed"`
+		Summary   string `json:"summary"`
+		Error     string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(AssistantText(okStateAssistant)), &okState); err != nil {
+		t.Fatalf("decode success compactcbstate JSON: %v", err)
+	}
+	if !okState.Completed {
+		t.Fatalf("expected completed=true for success path")
+	}
+	if strings.TrimSpace(okState.Summary) == "" {
+		t.Fatalf("expected non-empty summary for success path")
+	}
+	if okState.Error != "" {
+		t.Fatalf("expected empty error for success path, got %q", okState.Error)
+	}
+	if got := atomic.LoadInt32(&providerCalls); got < 6 {
+		t.Fatalf("expected provider calls for seed prompts + compaction summary, got %d", got)
+	}
+}
+
 func writeTestConfig(t *testing.T, agentDir, baseURL string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(agentDir, "auth.json"), []byte(`{
@@ -1717,6 +2838,36 @@ func writeTestConfig(t *testing.T, agentDir, baseURL string) {
 	}`
 	if err := os.WriteFile(filepath.Join(agentDir, "models.json"), []byte(modelsJSON), 0o644); err != nil {
 		t.Fatalf("write models.json: %v", err)
+	}
+}
+
+func writeOAuthTestConfig(t *testing.T, agentDir, baseURL string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(agentDir, "auth.json"), []byte(`{
+		"openai":{"type":"oauth","access":"oauth-access-token"}
+	}`), 0o644); err != nil {
+		t.Fatalf("write auth.json (oauth): %v", err)
+	}
+	modelsJSON := `{
+		"providers": {
+			"openai": {
+				"api": "openai-completions",
+				"models": [{
+					"id": "gpt-test",
+					"name": "gpt-test",
+					"provider": "openai",
+					"api": "openai-completions",
+					"baseUrl": "` + baseURL + `",
+					"reasoning": false,
+					"input": ["text"],
+					"contextWindow": 8192,
+					"maxTokens": 512
+				}]
+			}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(agentDir, "models.json"), []byte(modelsJSON), 0o644); err != nil {
+		t.Fatalf("write models.json (oauth): %v", err)
 	}
 }
 
@@ -1822,6 +2973,12 @@ func TestRuntimeSidecarHelperProcess(t *testing.T) {
 						SystemPrompt: "runtime-context-prompt",
 					},
 				})
+			case "session_shutdown":
+				markerPath := strings.TrimSpace(os.Getenv("GO_RUNTIME_SIDECAR_SHUTDOWN_MARKER"))
+				if markerPath != "" {
+					_ = os.WriteFile(markerPath, []byte("session_shutdown"), 0o644)
+				}
+				writeSidecarHelperResult(t, enc, req.ID, extensionsidecar.EmitResponse{})
 			default:
 				writeSidecarHelperResult(t, enc, req.ID, extensionsidecar.EmitResponse{})
 			}
