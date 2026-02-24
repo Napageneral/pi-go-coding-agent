@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/badlogic/pi-mono/go-coding-agent/internal/types"
 )
 
 func TestCoreTools(t *testing.T) {
@@ -123,5 +125,34 @@ func TestReadOffsetIsOneIndexed(t *testing.T) {
 	}
 	if len(res.Content) == 0 || !strings.HasPrefix(res.Content[0].Text, "b") {
 		t.Fatalf("expected read offset=2 to start at line b, got: %#v", res.Content)
+	}
+}
+
+func TestExternalDefinitionOverridesBuiltInTool(t *testing.T) {
+	cwd := t.TempDir()
+	reg := NewCodingRegistry(cwd)
+
+	reg.RegisterDefinitions([]types.Tool{
+		{
+			Name:        "read",
+			Description: "Extension read override",
+		},
+	})
+	reg.SetExternalExecutor(func(ctx context.Context, name, callID string, args map[string]interface{}) (types.ToolResult, bool, error) {
+		if name != "read" {
+			return types.ToolResult{}, false, nil
+		}
+		return types.ToolResult{
+			Content: []types.ContentBlock{{Type: "text", Text: "external-read"}},
+			IsError: false,
+		}, true, nil
+	})
+
+	res, err := reg.Execute(context.Background(), "read", "ext-read-1", map[string]interface{}{"path": "does-not-matter"})
+	if err != nil {
+		t.Fatalf("read override failed: %v", err)
+	}
+	if len(res.Content) == 0 || res.Content[0].Text != "external-read" {
+		t.Fatalf("unexpected read override output: %#v", res.Content)
 	}
 }

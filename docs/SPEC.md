@@ -3,7 +3,7 @@
 ## 1. Customer Experience
 
 Primary goal:
-- Deliver a native Go coding agent executable that can replace core coding-agent usage for project workflows without requiring RPC, TUI, or JS extensions.
+- Deliver a native Go coding agent executable that can replace core coding-agent usage for project workflows without requiring RPC or TUI.
 
 Must-have user experience:
 - Start or resume persistent sessions from disk.
@@ -14,8 +14,23 @@ Must-have user experience:
 
 Explicitly out of scope for v1:
 - TUI/interactive terminal UI parity.
-- JS extension runtime and package ecosystem.
-- Prompt-template/skill/extension package discovery.
+- Prompt-template/skill package discovery.
+
+Extension compatibility scope (phase 1):
+- Node sidecar extension runtime is in scope.
+- Sidecar protocol + lifecycle events are in scope.
+- Extension tool registration/execution via sidecar is in scope.
+- Extension event payload shape compatibility with upstream hook types is in scope (`message`, `toolCallId`, `input`, `args`, `result`, `partialResult`).
+- Extension flag/command/provider registration surfaces are in scope.
+- Extension command/event action bridge is in scope for core runtime actions (`sendUserMessage`, `sendMessage`, model/thinking updates).
+- Extension action bridge includes session metadata/state actions (`appendEntry`, `setSessionName`, `setLabel`) and active-tool control (`setActiveTools`).
+- Extension command-context session actions are in scope (`newSession`, `switchSession`, `fork`, `navigateTree`, `reload`, `waitForIdle`) with CLI-mode no-op behavior for unsupported interactive flows.
+- Session lifecycle hook parity is in scope for command/session control flows (`session_before_switch`, `session_before_fork`, `session_before_tree` cancellation and `session_switch`, `session_fork`, `session_tree` notifications).
+- Sidecar command-context session field sync (`sessionId`, `sessionFile`, `sessionName`) from host `session_start` events is in scope.
+- Sidecar-local extension event bus parity (`events.on/emit`) is in scope.
+- Extension tools may override built-in tool names.
+- `model_select` lifecycle emission on explicit model changes is in scope.
+- Upstream JS package-manager/discovery/install behavior remains out of scope.
 
 ## 2. Frozen Scope & Compatibility
 
@@ -42,6 +57,7 @@ Packages:
 - internal/providers: provider adapters + model/provider resolution.
 - internal/agent: runtime loop (LLM call -> tool calls -> tool results -> continue).
 - internal/config: settings/auth/model config loading.
+- internal/extensionsidecar: Node sidecar transport/client.
 - cmd/pi-go: CLI entrypoint (text mode).
 
 ## 4. Session Manager Requirements
@@ -78,6 +94,8 @@ Control:
 - Abort current run via signal.
 - Resume previous session.
 - Continue mode only when current leaf ends in `user`/`toolResult` (rejects dangling assistant leaf).
+- Steering queue support (interrupt after current tool execution, skip remaining tools in turn).
+- Follow-up queue support (continue with queued user message after agent would otherwise stop).
 
 ## 6. Tools Requirements
 
@@ -127,6 +145,11 @@ Flags:
 - --no-session
 - --cwd
 - --json
+- --continue
+- --system-prompt
+- --extension-sidecar-command
+- --extension-sidecar-arg (repeatable)
+- --extension (repeatable)
 
 Modes:
 - Text output default.
@@ -139,11 +162,20 @@ Required validation before calling complete:
 - Create session, prompt once, confirm JSONL persisted.
 - Resume same session and continue branch.
 - Verify at least one tool call path end-to-end.
+- Verify node-sidecar extension receives upstream-style event fields (`toolCallId`, `input`, `message`).
+- Verify extension tool override path for built-in tool names.
+- Verify extension command `pi.sendUserMessage(...)` triggers a native Go agent turn.
+- Verify extension command metadata actions persist to session (`appendEntry`, `setSessionName`).
+- Verify extension active-tool updates change provider tool context and enforce inactive-tool errors.
+- Verify extension command session-control actions (`newsession`, `switchsession`, `forkat`, `navigate`, `reloadcmd`, `waitcmd`) execute end-to-end.
+- Verify session lifecycle hook cancellation path for extension-driven session actions and confirm session state remains unchanged on cancel.
+- Verify host `session_start` refresh updates sidecar command-context session fields after `newSession`/`switchSession`/`fork`.
+- Verify `navigateTree` option payload (`summarize`, `customInstructions`, `replaceInstructions`, `label`) reaches `session_before_tree`.
+- Verify sidecar event bus `events.on/emit` works across commands.
 - Provider smoke checks for configured providers.
 
 ## 10. Non-Goals
 
 - TUI rendering.
-- Extension event system.
-- Pi package manager.
-- npm/git extension installation.
+- Pi package manager parity.
+- npm/git extension installation and package-source management.

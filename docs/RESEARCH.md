@@ -11,8 +11,14 @@ Desired UX for your projects:
 
 What you explicitly do **not** need for this phase:
 - TUI.
-- JS extension/package ecosystem.
-- Package-manager/runtime bootstrap for extension tools.
+- Upstream package-manager/discovery/install behavior for extensions.
+
+What is now in scope:
+- Node sidecar runtime for extensions.
+- Go host lifecycle/event and tool bridge to sidecar.
+- Agent-loop parity behaviors from `packages/agent` that matter for coding runtime control:
+  - steering queue interruption semantics.
+  - follow-up queue continuation semantics.
 
 ## 2. Dependency Coupling in TS Monorepo
 
@@ -69,3 +75,28 @@ Direct dependencies:
 
 Notes:
 - OpenAI/Anthropic/Google providers use native Go `net/http` paths in this module (no provider SDK dependency there right now).
+
+## 6. Extension Parity Findings (Current)
+
+High-impact upstream compatibility points now treated as first-class:
+- Event payload shape parity for common extension handlers:
+  - `message` envelope on message events.
+  - `toolCallId`/`input`/`args`/`result`/`partialResult` fields for tool lifecycle events.
+- `model_select` lifecycle emission when model changes via runtime API.
+- Extension tool override precedence for built-in tool names (e.g. extension `read` overrides built-in `read`).
+- Action bridge for extension commands/events so `pi.sendUserMessage(...)` can queue/trigger native Go turns.
+- Session metadata/state action parity for extension commands (`appendEntry`, `setSessionName`, `setLabel`).
+- Active-tool control parity path (`setActiveTools`) with host-side context filtering and inactive-tool enforcement.
+- Session-control command-context parity path (`newSession`, `switchSession`, `fork`, `navigateTree`) in CLI mode.
+- Session lifecycle hook parity path for extension-driven session control:
+  - `session_before_switch`/`session_before_fork`/`session_before_tree` cancel handling in host runtime.
+  - `session_switch`/`session_fork`/`session_tree` notifications emitted after state transitions.
+- Sidecar command-context session field sync from host `session_start` events.
+- Compatibility shims for upstream extension APIs commonly used by extensions:
+  - `pi.exec(...)` (spawn + stdout/stderr/code/killed result)
+  - `pi.registerMessageRenderer(...)` (no-op in CLI mode)
+- Sidecar-local extension event bus parity (`events.on/emit`) for extension-to-extension signaling.
+
+Still intentionally deferred:
+- Full interactive UI context parity and cross-process/runtime event bus parity.
+- Upstream package-manager/discovery/install behavior for extensions.

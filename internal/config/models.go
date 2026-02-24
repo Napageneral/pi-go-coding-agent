@@ -160,6 +160,38 @@ func (m *ModelRegistry) upsertProviderModels(provider string, models []types.Mod
 	}
 }
 
+func (m *ModelRegistry) RegisterProvider(provider string, cfg ProviderConfig) {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return
+	}
+	base := m.providerCfg[provider]
+	if strings.TrimSpace(cfg.BaseURL) != "" {
+		base.BaseURL = cfg.BaseURL
+	}
+	if strings.TrimSpace(cfg.API) != "" {
+		base.API = cfg.API
+	}
+	if strings.TrimSpace(cfg.APIKey) != "" {
+		base.APIKey = cfg.APIKey
+	}
+	if len(cfg.Headers) > 0 {
+		if base.Headers == nil {
+			base.Headers = map[string]string{}
+		}
+		for k, v := range cfg.Headers {
+			base.Headers[k] = v
+		}
+	}
+	m.providerCfg[provider] = base
+	if len(cfg.Models) > 0 {
+		m.upsertProviderModels(provider, cfg.Models, base)
+		if _, ok := m.defaultModel[provider]; !ok {
+			m.defaultModel[provider] = cfg.Models[0].ID
+		}
+	}
+}
+
 func (m *ModelRegistry) GetAll() []types.Model {
 	out := make([]types.Model, len(m.models))
 	copy(out, m.models)

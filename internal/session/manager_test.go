@@ -111,3 +111,66 @@ func TestAppendCompactionAndBranchSummary(t *testing.T) {
 		t.Fatal("expected branch summary in context messages")
 	}
 }
+
+func TestCustomEntriesLabelsAndSessionName(t *testing.T) {
+	tmp := t.TempDir()
+	sm := NewManager(tmp)
+	if err := sm.CreateNew(tmp, ""); err != nil {
+		t.Fatalf("CreateNew failed: %v", err)
+	}
+
+	userEntry, err := sm.AppendMessage(types.TextMessage(types.RoleUser, "hello"))
+	if err != nil {
+		t.Fatalf("append user failed: %v", err)
+	}
+	if _, err := sm.AppendLabel(userEntry.ID, "bookmark"); err != nil {
+		t.Fatalf("append label failed: %v", err)
+	}
+	if _, err := sm.AppendSessionName("alpha-session"); err != nil {
+		t.Fatalf("append session name failed: %v", err)
+	}
+	if got := sm.SessionName(); got != "alpha-session" {
+		t.Fatalf("session name = %q, want alpha-session", got)
+	}
+
+	if _, err := sm.AppendCustomEntry("ext.state", map[string]any{"k": "v"}); err != nil {
+		t.Fatalf("append custom entry failed: %v", err)
+	}
+	if _, err := sm.AppendCustomMessage(
+		"ext.msg",
+		[]types.ContentBlock{{Type: "text", Text: "custom in context"}},
+		true,
+		map[string]any{"source": "test"},
+	); err != nil {
+		t.Fatalf("append custom message failed: %v", err)
+	}
+
+	foundCustomMessage := false
+	ctx := sm.BuildContext("", sm.LeafID(), nil)
+	for _, msg := range ctx.Messages {
+		for _, c := range msg.Content {
+			if c.Type == "text" && c.Text == "custom in context" {
+				foundCustomMessage = true
+			}
+		}
+	}
+	if !foundCustomMessage {
+		t.Fatal("expected custom message content in context")
+	}
+
+	var foundLabel, foundCustom bool
+	for _, e := range sm.Entries() {
+		if e.Type == "label" && e.TargetID == userEntry.ID && e.Label == "bookmark" {
+			foundLabel = true
+		}
+		if e.Type == "custom" && e.CustomType == "ext.state" && e.CustomData["k"] == "v" {
+			foundCustom = true
+		}
+	}
+	if !foundLabel {
+		t.Fatal("expected label entry to be persisted")
+	}
+	if !foundCustom {
+		t.Fatal("expected custom entry to be persisted")
+	}
+}

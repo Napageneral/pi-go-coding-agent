@@ -309,6 +309,58 @@ func (m *Manager) AppendSessionName(name string) (Entry, error) {
 	return e, nil
 }
 
+func (m *Manager) SessionName() string {
+	name := ""
+	for _, e := range m.entries {
+		if e.Type != "session_info" {
+			continue
+		}
+		if strings.TrimSpace(e.Name) != "" {
+			name = e.Name
+		}
+	}
+	return name
+}
+
+func (m *Manager) AppendCustomEntry(customType string, data map[string]any) (Entry, error) {
+	e := Entry{
+		Type:       "custom",
+		ID:         m.nextID(),
+		ParentID:   m.leafID,
+		Timestamp:  nowTS(),
+		CustomType: customType,
+		CustomData: cloneAnyMap(data),
+	}
+	if err := m.appendEntry(e); err != nil {
+		return Entry{}, err
+	}
+	return e, nil
+}
+
+func (m *Manager) AppendCustomMessage(
+	customType string,
+	content []types.ContentBlock,
+	display bool,
+	details map[string]any,
+) (Entry, error) {
+	msgContent := make([]types.ContentBlock, len(content))
+	copy(msgContent, content)
+	e := Entry{
+		Type:       "custom_message",
+		ID:         m.nextID(),
+		ParentID:   m.leafID,
+		Timestamp:  nowTS(),
+		CustomType: customType,
+		Content:    msgContent,
+		Display:    display,
+		CustomData: cloneAnyMap(details),
+	}
+	if err := m.appendEntry(e); err != nil {
+		return Entry{}, err
+	}
+	return e, nil
+}
+
 func (m *Manager) Branch(leafID string) []Entry {
 	if leafID == "" {
 		leafID = m.leafID
@@ -486,6 +538,17 @@ func shortID() string {
 
 func nowTS() string {
 	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
+func cloneAnyMap(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 func ListSessions(sessionDir string) ([]Info, error) {

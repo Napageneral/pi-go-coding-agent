@@ -203,8 +203,9 @@ func (r *Runtime) runLoop() (types.Message, error) {
 			Model:   r.model,
 			Context: ctx,
 			Options: types.CompletionOptions{
-				APIKey:  r.auth.GetAPIKey(r.model.Provider),
-				Context: runCtx,
+				APIKey:    r.auth.GetAPIKey(r.model.Provider),
+				SessionID: r.session.SessionID(),
+				Context:   runCtx,
 			},
 		})
 		if err != nil {
